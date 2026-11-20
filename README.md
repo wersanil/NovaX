@@ -101,7 +101,7 @@ sudo apt install xorriso qemu-system-x86 build-essential git
 ### Build and boot
 
 ```bash
-git clone https://github.com/<your-org>/novax.git
+git clone https://github.com/wersanil/NovaX.git
 cd novax
 
 ./tools/fetch_limine.sh
