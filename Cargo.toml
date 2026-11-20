@@ -1,0 +1,20 @@
+[workspace]
+resolver = "2"
+# `kernel/memory` is a standalone no_std library crate (own workspace) and
+# a path dependency of the kernel. Keeping it out of this workspace lets
+# `cargo clippy --workspace --all-targets` run on a bare-metal target:
+# Cargo would otherwise try to link libtest, which does not exist for
+# x86_64-unknown-none.
+members  = ["kernel/heart"]
+exclude  = ["kernel/memory"]
+
+[profile.dev]
+panic    = "abort"
+opt-level = 1
+
+[profile.release]
+panic         = "abort"
+opt-level     = 2
+lto           = true
+codegen-units = 1
+debug         = true
