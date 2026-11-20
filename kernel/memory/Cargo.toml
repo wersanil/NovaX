@@ -1,0 +1,18 @@
+[package]
+name    = "novax_memory"
+version = "0.1.0"
+edition = "2021"
+
+# Standalone workspace: the crate is built as a path dependency of the
+# kernel, but its targets are checked independently of `kernel/heart`.
+[workspace]
+
+[dependencies]
+# Пока пусто. Крейт зависим только от core.
+
+# The crate targets x86_64-unknown-none: a cargo test harness (libtest)
+# cannot be linked there, and its unit tests would need kernel context.
+# Behaviour is covered by the in-kernel `--features test` suite instead.
+[lib]
+test = false
+doctest = false

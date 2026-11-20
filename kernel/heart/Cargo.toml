@@ -1,0 +1,22 @@
+[package]
+name    = "novax_heart"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+limine                = "0.6.5"
+spin                  = "0.12.3"
+linked_list_allocator = "0.10"
+x86_64                = "0.15.2"
+novax_memory          = { path = "../memory" }
+
+[features]
+test = []
+
+[[bin]]
+name = "novax_heart"
+path = "src/main.rs"
+# No libtest harness on a bare-metal target; the kernel self-tests run
+# inside QEMU with `--features test`.
+test = false
+bench = false
