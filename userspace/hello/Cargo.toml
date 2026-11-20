@@ -1,0 +1,13 @@
+[package]
+name    = "hello"
+version = "0.1.0"
+edition = "2021"
+
+# Отдельный workspace — не часть novax, иначе подхватит его .cargo/config.
+[workspace]
+
+[profile.release]
+panic         = "abort"
+opt-level     = 2
+lto           = true
+codegen-units = 1
