@@ -190,8 +190,8 @@ shortcuts. The full list lives in the architecture document.
 
 > **FreeMind Soft** — systems software, low-level engineering, open source.
 
-- Author: [GitHub profile](https://github.com) <!-- TODO: replace with the author profile URL -->
-- Telegram: [FreeMind Soft Telegram](https://t.me) <!-- TODO: replace with the channel URL -->
+- Author: [GitHub profile](https://github.com/wersanil) <!-- TODO: replace with the author profile URL -->
+- Telegram: [FreeMind Soft Telegram](https://t.me/freemind_soft) <!-- TODO: replace with the channel URL -->
 
 ## // 07 — LICENSE
 
