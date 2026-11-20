@@ -1,0 +1,17 @@
+# Build artifacts
+target/
+build/
+*.iso
+*.log
+*.sock
+
+# Fetched bootloader payload. `boot/limine/linker.ld` and
+# `boot/limine/limine.conf` are already tracked and stay in the repo.
+boot/limine/
+
+# Vendored sources and local history
+third_party/
+git_commits/
+
+# Internal working notes
+agen_mem.txt
