@@ -30,7 +30,9 @@ fn main() {
     let abi = root.join("userspace/common/abi.rs");
     println!("cargo:rerun-if-changed={}", abi.display());
 
-    let user_progs = ["client", "server", "serial", "kbd", "init", "shell", "net"];
+    let user_progs = [
+        "client", "server", "serial", "kbd", "init", "shell", "net", "fb",
+    ];
     for prog in user_progs {
         let user_dir = root.join(format!("userspace/{prog}"));
         let src = user_dir.join("src/main.rs");
