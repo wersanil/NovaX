@@ -84,6 +84,19 @@ impl fmt::Write for Uart {
 
 static SERIAL: Mutex<Option<Uart>> = Mutex::new(None);
 
+/// Writer that feeds both COM1 and the kernel console mirror.
+struct Tee<'a> {
+    uart: &'a mut Uart,
+}
+
+impl fmt::Write for Tee<'_> {
+    fn write_str(&mut self, s: &str) -> fmt::Result {
+        self.uart.write_str(s)?;
+        crate::console::push(s.as_bytes());
+        Ok(())
+    }
+}
+
 /// Bring up COM1 and publish it to the global writer. Safe to call once.
 pub fn init() {
     let uart = Uart::new(COM1);
@@ -103,8 +116,10 @@ pub fn _print(args: fmt::Arguments<'_>) {
         use fmt::Write;
         if let Some(uart) = SERIAL.lock().as_mut() {
             // fmt::Write for the UART sink is infallible; the Result only
-            // exists to satisfy the trait.
-            let _ = uart.write_fmt(args);
+            // exists to satisfy the trait. The same formatted text is
+            // offered to the graphical console on a best-effort basis.
+            let mut tee = Tee { uart };
+            let _ = tee.write_fmt(args);
         }
     });
 }
