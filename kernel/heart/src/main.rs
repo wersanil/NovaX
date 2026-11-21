@@ -10,9 +10,11 @@ extern crate alloc;
 
 mod arch;
 mod bootinfo;
+mod console;
 mod dma;
 mod heap;
 mod ipc;
+mod mmio;
 mod panic;
 #[cfg(not(feature = "test"))]
 mod pci;
@@ -67,6 +69,19 @@ pub extern "C" fn _start() -> ! {
 
     crate::serial_println!("hhdm offset: {:#x}", info.hhdm.as_u64());
     crate::serial_println!("memmap entries: {}", info.region_count);
+    if let Some(fb) = info.framebuffer {
+        crate::serial_println!(
+            "fb: {}x{} pitch={} bpp={} paddr={:#x} len={:#x}",
+            fb.width,
+            fb.height,
+            fb.pitch,
+            fb.bpp,
+            fb.paddr,
+            fb.len
+        );
+    } else {
+        crate::serial_println!("fb: no framebuffer (headless mode)");
+    }
 
     // WHY unsafe: see `FrameAllocator::new` and `PageTableRef::active`
     // safety contracts; both are satisfied by limine-supplied values.
@@ -190,6 +205,56 @@ pub extern "C" fn _start() -> ! {
         }
 
         crate::serial_println!("Milestone 6: userspace drivers spawned");
+
+        // 6b. Framebuffer server. The kernel only passes a bounded MMIO
+        //     capability and geometry over IPC; all pixels are drawn by the
+        //     ring-3 fb server.
+        if let Some(fb) = info.framebuffer {
+            let fb_info_ep = ipc::create_endpoint();
+            let fb_console_ep = ipc::create_endpoint();
+
+            ipc::send(
+                fb_info_ep,
+                ipc::Message {
+                    data: {
+                        let mut data = [0u8; ipc::MAX_MSG_LEN];
+                        data[..bootinfo::FB_INFO_LEN].copy_from_slice(&fb.info_message());
+                        data
+                    },
+                    len: bootinfo::FB_INFO_LEN,
+                    sender: 0,
+                },
+            );
+
+            let mut fb_caps = [None; 16];
+            fb_caps[1] = Some(ipc::Capability {
+                kind: ipc::CapKind::Mmio {
+                    paddr: fb.paddr,
+                    len: fb.len,
+                },
+                rights: ipc::CAP_READ | ipc::CAP_WRITE,
+            });
+            fb_caps[2] = Some(ipc::Capability {
+                kind: ipc::CapKind::Endpoint(fb_info_ep),
+                rights: ipc::CAP_READ,
+            });
+            fb_caps[3] = Some(ipc::Capability {
+                kind: ipc::CapKind::Endpoint(fb_console_ep),
+                rights: ipc::CAP_READ,
+            });
+
+            let fb_elf = include_bytes!(concat!(env!("OUT_DIR"), "/fb.elf"));
+            match user::launch(fb_elf, fb_caps) {
+                Ok(tid) => {
+                    crate::serial_println!("fb thread id = {}", tid);
+                    console::attach(fb_console_ep);
+                    crate::serial_println!("fb: graphical console attached");
+                }
+                Err(e) => crate::serial_println!("fb: launch failed: {:?}", e),
+            }
+        } else {
+            crate::serial_println!("fb: graphical console disabled");
+        }
 
         // 7. Init + shell servers. Replies from init reach the shell over
         //    their own endpoint, so nothing is shortcut through the kernel.
