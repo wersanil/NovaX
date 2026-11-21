@@ -21,6 +21,12 @@ pub const SYS_INW: u64 = 10;
 pub const SYS_OUTW: u64 = 11;
 pub const SYS_INL: u64 = 12;
 pub const SYS_OUTL: u64 = 13;
+pub const SYS_MAP_MMIO: u64 = 14;
+
+/// Magic number at the start of an `FbInfo` message ("NVFB").
+pub const FB_INFO_MAGIC: u32 = 0x4E56_4642;
+/// Size of the fixed `FbInfo` wire message.
+pub const FB_INFO_LEN: usize = 48;
 
 /// Raw three-argument syscall (number in `rax`, args in `rdi/rsi/rdx`).
 ///
@@ -131,6 +137,14 @@ pub fn dma_alloc(dma_cap: u64, out: &mut [u8; 16]) -> u64 {
     // SAFETY: `out` is a live 16-byte buffer written exactly once by the
     // kernel before the syscall returns.
     unsafe { syscall3(SYS_DMA_ALLOC, dma_cap, out.as_mut_ptr() as u64, 0) }
+}
+
+/// Map the physical window granted by `mmio_cap`; the kernel writes
+/// `{virt, paddr, len}` (three little-endian `u64`s) into `out`.
+pub fn map_mmio(mmio_cap: u64, out: &mut [u8; 24]) -> u64 {
+    // SAFETY: `out` is a live 24-byte buffer written exactly once by the
+    // kernel before the syscall returns.
+    unsafe { syscall3(SYS_MAP_MMIO, mmio_cap, out.as_mut_ptr() as u64, 0) }
 }
 
 /// Terminate the calling thread. Never returns.
