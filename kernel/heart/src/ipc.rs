@@ -39,6 +39,13 @@ pub enum CapKind {
         /// Maximum number of bytes the holder may map.
         len: u32,
     },
+    /// Physical MMIO window the holder may map into its own address space.
+    Mmio {
+        /// Physical base address.
+        paddr: u64,
+        /// Window length in bytes.
+        len: u64,
+    },
 }
 
 /// Right to receive from an endpoint.
@@ -50,6 +57,8 @@ pub const CAP_NOTIFY: u32 = 4;
 
 /// Maximum payload of one IPC message.
 pub const MAX_MSG_LEN: usize = 64;
+/// Maximum number of queued messages per endpoint for non-blocking senders.
+pub const MAX_TRY_QUEUE: usize = 1024;
 /// Number of legacy ISA IRQ lines the router tracks.
 pub const MAX_IRQS: usize = 16;
 
@@ -109,6 +118,30 @@ pub fn send(ep_id: u64, msg: Message) {
             crate::sched::wake_thread(tid);
         }
     }
+}
+
+/// Best-effort variant of [`send`] for kernel console mirroring.
+///
+/// Returns `false` instead of waiting when the endpoint lock is busy or the
+/// receiver's queue is full. The caller (the serial console) must never
+/// block on a slow or stalled userspace consumer.
+pub fn try_send(ep_id: u64, msg: Message) -> bool {
+    let Some(mut ipc) = IPC.try_lock() else {
+        return false;
+    };
+    let Some(ep) = ipc.endpoints.iter_mut().find(|e| e.id == ep_id) else {
+        return false;
+    };
+    if ep.queue.len() >= MAX_TRY_QUEUE {
+        return false;
+    }
+    ep.queue.push_back(msg);
+    let wake = ep.blocked_receiver.take();
+    drop(ipc);
+    if let Some(tid) = wake {
+        crate::sched::wake_thread(tid);
+    }
+    true
 }
 
 /// Pop one message from `ep_id`, or register the caller as the blocked
