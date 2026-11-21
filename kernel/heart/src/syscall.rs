@@ -21,6 +21,7 @@ const SYS_INW: u64 = 10;
 const SYS_OUTW: u64 = 11;
 const SYS_INL: u64 = 12;
 const SYS_OUTL: u64 = 13;
+const SYS_MAP_MMIO: u64 = 14;
 
 /// Entry point called from `syscall_entry` with the user arguments.
 ///
@@ -46,6 +47,7 @@ pub extern "C" fn syscall_dispatch(num: u64, a1: u64, a2: u64, a3: u64) -> u64 {
         SYS_OUTW => sys_outw(a1, a2, a3),
         SYS_INL => sys_inl(a1, a2),
         SYS_OUTL => sys_outl(a1, a2, a3),
+        SYS_MAP_MMIO => sys_map_mmio(a1, a2),
         _ => u64::MAX, // ENOSYS
     }
 }
@@ -312,10 +314,33 @@ fn sys_dma_alloc(cap_idx: u64, out_ptr: u64) -> u64 {
     }
 }
 
+/// Map a physical MMIO window granted by `CapKind::Mmio` into the caller
+/// and report `{virt, paddr, len}`. The kernel never reads or writes the
+/// window itself.
+fn sys_map_mmio(cap_idx: u64, out_ptr: u64) -> u64 {
+    let cap = match sched::get_current_cap(cap_idx) {
+        Some(c) => c,
+        None => return u64::MAX,
+    };
+    if cap.rights & (CAP_READ | CAP_WRITE) != CAP_READ | CAP_WRITE {
+        return u64::MAX;
+    }
+    match cap.kind {
+        CapKind::Mmio { paddr, len } => match crate::mmio::map_for_current(paddr, len, out_ptr) {
+            Ok(()) => 0,
+            Err(e) => {
+                crate::serial_println!("mmio: map failed: {:?}", e);
+                u64::MAX
+            }
+        },
+        _ => u64::MAX,
+    }
+}
+
 /// Copy `dst.len()` bytes from the user address `src`.
 ///
 /// Only range-checks against the user half; the kernel has no SMAP, so a
-/// bad pointer is a kernel fault (documented v0.1.0 limitation).
+/// bad pointer is a kernel fault (documented v0.1.1 limitation).
 pub fn copy_from_user(dst: &mut [u8], src: u64) -> Result<(), ()> {
     const USER_MAX: u64 = 0x0000_8000_0000_0000;
     let end = src.checked_add(dst.len() as u64).ok_or(())?;
@@ -325,7 +350,7 @@ pub fn copy_from_user(dst: &mut [u8], src: u64) -> Result<(), ()> {
     for (i, b) in dst.iter_mut().enumerate() {
         // SAFETY: the range was bounds-checked against USER_MAX above; the
         // kernel has no SMAP, so a user page is readable from ring 0. A bad
-        // pointer is still a kernel fault (see the v0.1.0 limitations).
+        // pointer is still a kernel fault (see the v0.1.1 limitations).
         unsafe { *b = core::ptr::read_volatile((src + i as u64) as *const u8) };
     }
     Ok(())
