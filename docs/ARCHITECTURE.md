@@ -1,4 +1,4 @@
-# NovaX — Architecture & Project Summary (v0.1.0, Milestones 0–9)
+# NovaX — Architecture & Project Summary (v0.1.1, Milestones 0–10)
 
 Microkernel OS for x86_64. `Heart` keeps only what cannot live in userspace:
 memory, scheduling, IPC, syscalls, IRQ routing. Drivers and services are
@@ -15,7 +15,9 @@ kernel/heart/                  microkernel binary (no_std)
   src/main.rs                  boot flow, device wiring, SMP demo
   src/arch/x86_64.rs           GDT/TSS/IDT, IOAPIC, LAPIC, syscall, IRQ, switch
   src/arch/smp.rs              PerCpu (GS-based), MP discovery, AP boot
-  src/bootinfo.rs              Limine: revision, HHDM, memmap, MP
+  src/bootinfo.rs              Limine: revision, HHDM, memmap, MP, framebuffer
+  src/console.rs               boot-log ring + best-effort fb mirror
+  src/mmio.rs                  capability-checked physical MMIO mapping
   src/heap.rs                  1 MiB heap @ 0xffff_ffff_9000_0000
   src/sched.rs                 TCB, per-CPU queues, affinity, switching
   src/ipc.rs                   endpoints, messages, caps, IRQ routes
@@ -36,9 +38,10 @@ userspace/                     single-file programs, one linker.ld each
   kbd/                         PS/2 server, IRQ1
   init/                        command server ("echo ..." -> reply)
   shell/                       line editor, forwards commands to init
+  fb/                          ring-3 framebuffer text console
   net/                         virtio-net server (ARP + ICMP)
-tools/                         fetch_limine, mkiso, qemu_run, test,
-                               m6/m7/m8/m9 test + check, git_commit
+tools/                         fetch_limine, mkiso, qemu_run, qemu_gui,
+                               test, m6/m7/m8/m9 test + check, git_commit
 ```
 
 Every userspace program pulls in `userspace/common/abi.rs` with
@@ -49,9 +52,10 @@ project is needed, so `build.rs` still invokes plain `rustc` per program.
 ## 2. Kernel architecture
 ### Boot and memory
 
-Limine (base revision 3) provides HHDM, memory map and CPU list. The frame
-allocator keeps a bitmap in the first large enough USABLE region. Init order:
-per-CPU GDT/TSS → IDT → mask PIC → IOAPIC → LAPIC → syscalls → MP discovery;
+Limine (base revision 3) provides HHDM, memory map, CPU list and, when a
+display is present, a linear framebuffer. The frame allocator keeps a
+bitmap in the first large enough USABLE region. Init order: per-CPU
+GDT/TSS → IDT → mask PIC → IOAPIC → LAPIC → syscalls → MP discovery;
 APs start after all userspace threads are spawned.
 - 4 KiB frames; all physical access via the HHDM. 4-level paging with
   `PRESENT`/`WRITABLE`/`USER`/`NO_EXEC`/`PWT`/`PCD`; intermediate tables
@@ -61,6 +65,15 @@ APs start after all userspace threads are spawned.
   ELF `PT_LOAD` segments and a 2-page stack at `0x7fff_ffff_0000`.
 - `dma.rs` maps contiguous zeroed frames at user VA `0x3000_0000` and
   returns `{virt, phys}` to the driver.
+- `bootinfo.rs` requests a framebuffer and stores `{paddr, len, width,
+  height, pitch, bpp, RGB masks}`. Limine reports a virtual HHDM address;
+  the kernel subtracts the HHDM offset. If no framebuffer exists (for
+  example `-nographic -vga none`), the field is `None` and boot continues
+  without a graphical console.
+- `mmio.rs` maps a capability-granted physical window into the calling
+  process's PML4 at user VA `0x4000_0000`, using `PRESENT | USER |
+  WRITABLE | NO_EXEC | PCD | PWT` (uncached). The kernel never reads or
+  writes the window itself.
 ### Scheduler and SMP
 
 - `Tcb`: id, state (Ready/Running/Blocked/Dead), saved `rsp`, 16 KiB kernel
@@ -99,6 +112,7 @@ APs start after all userspace threads are spawned.
 | 7/8 | INB/OUTB | io_cap, offset[, value] | byte / 0 |
 | 9 | DMA_ALLOC | dma_cap, out_ptr | 0 |
 | 10–13 | INW/OUTW/INL/OUTL | io_cap, offset[, value] | word/dword / 0 |
+| 14 | MAP_MMIO | mmio_cap, out_ptr | 0; writes `{virt, paddr, len}` |
 Errors return `u64::MAX`; kernel internals use `Result<T, E>`.
 ### IPC and capabilities
 
@@ -107,10 +121,14 @@ Errors return `u64::MAX`; kernel internals use `Result<T, E>`.
   `recv` returns a queued message or blocks.
 - cspace = `[Option<Capability>; 16]`; `Capability = { kind, rights }`,
   rights = `CAP_READ`, `CAP_WRITE`, `CAP_NOTIFY`.
-- Kinds: `Endpoint(id)`, `Irq(n)`, `IoPort { base, len }`, `Dma { len }`.
-  IRQ model: the handler masks the line, enqueues one byte "IRQ n" on the
-  registered endpoint and EOIs the LAPIC; the driver drains the device and
-  calls `SYS_IRQ_ACK`, which unmasks the IOAPIC entry.
+- Kinds: `Endpoint(id)`, `Irq(n)`, `IoPort { base, len }`, `Dma { len }`,
+  `Mmio { paddr, len }`. IRQ model: the handler masks the line, enqueues
+  one byte "IRQ n" on the registered endpoint and EOIs the LAPIC; the
+  driver drains the device and calls `SYS_IRQ_ACK`, which unmasks the
+  IOAPIC entry.
+- `ipc::try_send` is the non-blocking console path: it uses `try_lock`,
+  caps an endpoint queue at 1024 messages and drops on overflow. The
+  serial console therefore never waits for a stalled fb server.
 
 ## 3. Userspace servers
 
@@ -122,9 +140,35 @@ Errors return `u64::MAX`; kernel internals use `Result<T, E>`.
 | `kbd` | Irq(1), irq_ep, IoPort 0x60+5 | PS/2 scancodes |
 | `init` | init_ep R, reply_ep W | `echo <text>` / `unknown command` |
 | `shell` | init_ep W, shell_in R, reply_ep R | line buffer + printing |
+| `fb` | Mmio, fb_info R, fb_console R | 8x16 text console on the framebuffer |
 | `net` | IoPort(BAR0), Dma(64 KiB) | virtio-net, ARP, ICMP |
 Path: keyboard/COM1 → `serial` → `shell_in_ep` → `shell` → `init_ep` →
-`init` → `reply_ep` → `shell` → console via `SYS_WRITE`.
+`init` → `reply_ep` → `shell` → console via `SYS_WRITE` (COM1 and,
+when present, the fb console).
+### Framebuffer console (v0.1.1)
+
+The kernel requests a Limine framebuffer and grants the `fb` server:
+
+1. `CapKind::Mmio { paddr, len }` for the linear framebuffer;
+2. `Endpoint(fb_info)` carrying one 48-byte `FbInfo` message
+   (`magic`, version, width, height, pitch, bpp, RGB masks, paddr, len);
+3. `Endpoint(fb_console)` carrying mirrored console bytes.
+
+`fb` calls `SYS_MAP_MMIO`, receives `{virt, paddr, len}`, then renders a
+text console with an embedded 8x16 ASCII font. The style is NovaX
+cybercore: `#0A0A0C` background, a red `#E60000` banner
+`NOVAX v0.1.1 // HEART MICROKERNEL`, and `#E5E5E5` text. The banner and a
+separator stay pinned to the top; the log area below scrolls when full.
+Supported formats are 32/24/16 bpp with RGB masks from `FbInfo`; any
+other format makes `fb` log an error and exit instead of panicking.
+
+`console.rs` mirrors every `serial_print*!` byte. Until `fb` attaches it
+keeps a 32 KiB boot-log ring; `attach` replays it so the screen shows the
+boot from `NovaX booting...`. After that, bytes are offered with
+`ipc::try_send` and dropped if the fb queue is full. The serial path
+remains the primary console and is never blocked by the graphical one.
+If no framebuffer exists, `fb` is not spawned and the kernel logs
+`fb: no framebuffer (headless mode)`.
 ### virtio-net
 
 Kernel finds PCI `1af4:1000` on the root bus (legacy device; QEMU uses
@@ -146,11 +190,18 @@ from `./tools/fetch_limine.sh`.
 cd ~/novax/novax
 cargo build --release -p novax_heart     # kernel + userspace ELFs
 ./tools/mkiso.sh                         # build/novax.iso
-./tools/qemu_run.sh                      # q35, -smp 2, netdev user
+./tools/qemu_run.sh                      # q35, -smp 2, netdev user, serial
+./tools/qemu_gui.sh                      # graphical window, -vga std
 # direct flags: -M q35 -smp 2 -m 512M -nographic -no-reboot \
 #   -boot d -cdrom build/novax.iso -netdev user,id=n0 \
 #   -device virtio-net-pci,netdev=n0,disable-modern=on
 ```
+
+`qemu_gui.sh` keeps the serial log in the terminal (`-serial mon:stdio`)
+and opens QEMU's default display with `-vga std`. Set `QEMU_DISPLAY=sdl`
+or `QEMU_DISPLAY=none` to override the backend. The ISO also boots
+headless: without a framebuffer the kernel skips `fb` and continues on
+COM1 exactly as before.
 
 Lint and format gates (release tree is clean):
 
@@ -176,12 +227,16 @@ Reference M9 log (trimmed):
 ```
 NovaX booting...
 hhdm offset: 0xffff800000000000
+fb: 1280x800 pitch=5120 bpp=32 paddr=0xfd000000 len=0x3e8000
 heap:  1024 KiB @ 0xffffffff90000000
 ioapic: id=0, version=0x20, entries=24
 lapic: bsp id=0, virt=0xffffffffb0000000
 smp: 2 cpu(s) reported by limine
 Milestone 5: OK
 Milestone 6: userspace drivers spawned
+fb thread id = 11
+fb: graphical console attached
+fb: ready
 Milestone 7: init + shell spawned
 pci: virtio-net 1af4:1000 io=0xc040+0x20 irq=11
 Milestone 9: virtio-net driver spawned
@@ -194,18 +249,29 @@ net: ping 10.0.2.2 seq=1 ok
 net: ping 10.0.2.2 ok
 ```
 
-### Release polish (v0.1.0)
+### Release polish (v0.1.1)
 
-- Every `unsafe` block carries a `SAFETY`/`WHY` rationale; public kernel
-  structures and the `novax_memory` crate carry rustdoc.
-- `build.rs` validates its environment instead of `unwrap()`-ing paths;
-  userspace programs share `common/abi.rs` instead of duplicating stubs.
-- `cargo fmt --all` applied; clippy is clean with `-D warnings` in the
-  release, `--features test` and standalone `novax_memory` configurations.
-- All five QEMU checks pass: `test`, `m6`, `m7`, `m8`, `m9`.
+- Limine framebuffer request with a headless fallback; no panic when the
+  bootloader has no display.
+- New `Mmio { paddr, len }` capability and `SYS_MAP_MMIO`; physical video
+  memory is mapped only into the fb server's PML4, uncached and NX.
+- Ring-3 `fb` server: 8x16 ASCII font, NovaX cybercore palette, pinned
+  banner, scrolling log area.
+- Kernel console mirror with boot-log replay and strictly best-effort
+  `try_send` delivery; serial remains authoritative.
+- `tools/qemu_gui.sh` for a graphical QEMU window; all five existing
+  QEMU checks remain green.
 
-## 5. Limitations (v0.1.0)
+## 5. Limitations (v0.1.1)
 
+- **One linear framebuffer**: no multi-monitor, no mode setting, no
+  double buffering; `fb` writes directly to the MMIO window.
+- **Uncached MMIO only**: `SYS_MAP_MMIO` uses `PCD | PWT`; write-combining
+  would need PAT setup and is not implemented.
+- **ASCII console**: 8x16 glyphs, no Unicode, font scaling, cursor
+  blinking or ANSI escape parsing. Output beyond the fb queue is dropped.
+- **No graphical input**: keyboard input still travels through PS/2 →
+  `kbd` → `serial` → shell; `fb` is output-only.
 - **Legacy virtio only**: no modern virtio 1.0, no MSI-X; the net driver
   polls the used ring instead of using IRQ 11.
 - **Networking is a demo**: static IP, ARP + ICMP only; no DHCP, IPv6,
@@ -216,7 +282,8 @@ net: ping 10.0.2.2 ok
 - **No process model**: no fork/exec, file descriptors or `wait`; no
   VFS/ramfs, no devmgr, no ACPI; PCI is root bus + legacy config only.
 - **No SMAP/SMEP**, no global W^X, user copies only range-checked.
-- **Fixed limits**: 16 caps/thread, 64-byte messages, 8 CPUs, one DMA window.
+- **Fixed limits**: 16 caps/thread, 64-byte messages, 8 CPUs, one DMA
+  window, one 256 MiB MMIO window.
 - **No `libnovax`**: `userspace/common/abi.rs` removes the duplicated
   syscall stubs, but there is no reusable userspace library crate yet;
   logging is direct `SYS_WRITE`, not a serial-server protocol.
