@@ -16,7 +16,7 @@
   <a href="https://github.com"><img alt="FreeMind Soft" src="https://img.shields.io/badge/FreeMind_Soft-project-39ff14?style=flat-square&labelColor=0b0f14"></a>
 </p>
 
-<p align="center"><sub>v0.1.0 · Milestones 0–9 · <a href="docs/ARCHITECTURE.md">Architecture</a></sub></p>
+<p align="center"><sub>v0.1.1 · Ring-3 Framebuffer & Capability Microkernel · <a href="docs/ARCHITECTURE.md">Architecture</a></sub></p>
 
 ---
 
@@ -176,8 +176,9 @@ Deep dive: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
 ## // 05 — STATUS
 
-v0.1.0 is a working research kernel, not a general-purpose OS.
+v0.1.1 is a working research kernel, not a general-purpose OS.
 
+- Graphics runs over the boot-time GOP/VBE linear framebuffer via userspace/fb (no runtime modesetting or 2D/3D hardware acceleration yet).
 - Legacy virtio only; the net driver polls the used ring (no MSI-X).
 - Networking is ARP + ICMP only; no DHCP, UDP or TCP.
 - No process model (fork/exec/wait), no VFS, no ACPI, no SMAP/SMEP.
@@ -200,4 +201,4 @@ See [LICENSE](LICENSE).
 
 ---
 
-<p align="center"><sub>NovaX v0.1.0 · FreeMind Soft · small kernel, explicit authority</sub></p>
+<p align="center"><sub>NovaX v0.1.1 · FreeMind Soft · small kernel, explicit authority</sub></p>
