@@ -55,14 +55,19 @@ project is needed, so `build.rs` still invokes plain `rustc` per program.
 Limine (base revision 3) provides HHDM, memory map, CPU list and, when a
 display is present, a linear framebuffer. The frame allocator keeps a
 bitmap in the first large enough USABLE region. Init order: per-CPU
-GDT/TSS → IDT → mask PIC → IOAPIC → LAPIC → syscalls → MP discovery;
-APs start after all userspace threads are spawned.
+GDT/TSS → IDT → mask PIC → LAPIC (map + id) → IOAPIC → syscalls → MP
+discovery; APs start after all userspace threads are spawned.
 - 4 KiB frames; all physical access via the HHDM. 4-level paging with
   `PRESENT`/`WRITABLE`/`USER`/`NO_EXEC`/`PWT`/`PCD`; intermediate tables
   are present+writable+user.
 - Kernel heap: 1 MiB of mapped frames via `linked_list_allocator`.
 - Each process gets a private PML4 (user half cleared, kernel half cloned);
   ELF `PT_LOAD` segments and a 2-page stack at `0x7fff_ffff_0000`.
+  `load_elf` validates the header table, every `p_offset/p_filesz` and
+  `p_vaddr/p_memsz` pair, requires segments to stay in the user half and
+  outside the stack/DMA/MMIO windows, and rejects the image before any
+  frame is allocated if validation fails. A failed load frees every frame
+  and page table it created.
 - `dma.rs` maps contiguous zeroed frames at user VA `0x3000_0000` and
   returns `{virt, phys}` to the driver.
 - `bootinfo.rs` requests a framebuffer and stores `{paddr, len, width,
@@ -83,7 +88,10 @@ APs start after all userspace threads are spawned.
   `idle_slot`. `pick_next` considers only threads pinned to that CPU and
   skips idle threads (idle is the fallback).
 - `switch_context` (naked asm) saves rbp/rbx/r12–r15/rflags, swaps `rsp`.
-  Address space and `TSS.rsp0` are updated before the switch.
+  Address space and `TSS.rsp0` are updated before the switch. New threads
+  start with `IF=0`; a thread that needs timer preemption enables
+  interrupts itself. AP idle runs `cli; schedule; sti; hlt`, so the
+  scheduler lock is never taken with interrupts enabled.
 - `wake_pending` closes the lost-wakeup race between `ipc::recv` and
   `block_current`; cross-CPU wakeups send a reschedule IPI.
 - `PerCpu` (GS-based) holds kernel/user rsp, current index, LAPIC id, idle
@@ -100,6 +108,11 @@ APs start after all userspace threads are spawned.
 - Input: `rax` = number, `rdi`, `rsi`, `rdx` = arguments.
 - Output: `rax`; `rcx`/`r11` are clobbered by the instruction itself.
 - Other GPRs preserved; per-CPU `kernel_rsp`/`user_rsp` via `gs:`.
+- Every user pointer is walked page by page against the current PML4
+  before it is dereferenced: the pages must be `USER` and, for output,
+  `WRITABLE`. Invalid pointers return `u64::MAX` instead of faulting in
+  ring 0. A ring-3 `#PF/#GP/#UD/#DE/#SS/#AC` terminates the faulting
+  thread; ring-0 faults still panic.
 | # | Syscall | Arguments | Result |
 |---|---------|-----------|--------|
 | 0 | EXIT | code | — |
@@ -118,7 +131,9 @@ Errors return `u64::MAX`; kernel internals use `Result<T, E>`.
 
 - Endpoints have a FIFO (messages ≤64 bytes) and at most one blocked
   receiver. `send` wakes it (or sets `wake_pending` if it is running);
-  `recv` returns a queued message or blocks.
+  `recv` returns a queued message, blocks, or reports that another
+  receiver is already blocked. The FIFO is capped at 1024 messages for
+  both senders; a full queue makes `SYS_SEND` return `u64::MAX`.
 - cspace = `[Option<Capability>; 16]`; `Capability = { kind, rights }`,
   rights = `CAP_READ`, `CAP_WRITE`, `CAP_NOTIFY`.
 - Kinds: `Endpoint(id)`, `Irq(n)`, `IoPort { base, len }`, `Dma { len }`,
@@ -281,7 +296,8 @@ net: ping 10.0.2.2 ok
 - **No TLB shootdown**; safe only because each process runs on one CPU.
 - **No process model**: no fork/exec, file descriptors or `wait`; no
   VFS/ramfs, no devmgr, no ACPI; PCI is root bus + legacy config only.
-- **No SMAP/SMEP**, no global W^X, user copies only range-checked.
+- **No SMAP/SMEP**, no global W^X; user copies validate page mapping and
+  rights, but the hardware still permits a ring-0 access to a user page.
 - **Fixed limits**: 16 caps/thread, 64-byte messages, 8 CPUs, one DMA
   window, one 256 MiB MMIO window.
 - **No `libnovax`**: `userspace/common/abi.rs` removes the duplicated
