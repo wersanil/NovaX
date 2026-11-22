@@ -57,13 +57,17 @@ pub const CAP_NOTIFY: u32 = 4;
 
 /// Maximum payload of one IPC message.
 pub const MAX_MSG_LEN: usize = 64;
-/// Maximum number of queued messages per endpoint for non-blocking senders.
-pub const MAX_TRY_QUEUE: usize = 1024;
+/// Maximum number of queued messages per endpoint. Both the blocking and
+/// the best-effort senders respect this bound so a ring-3 flood cannot
+/// exhaust the kernel heap.
+pub const MAX_QUEUE: usize = 1024;
+/// Maximum number of queued messages for non-blocking senders.
+pub const MAX_TRY_QUEUE: usize = MAX_QUEUE;
 /// Number of legacy ISA IRQ lines the router tracks.
 pub const MAX_IRQS: usize = 16;
 
 /// One queued IPC message. `len` bytes of `data` are meaningful.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 pub struct Message {
     /// Payload bytes.
     pub data: [u8; MAX_MSG_LEN],
@@ -109,15 +113,26 @@ pub fn create_endpoint() -> u64 {
 }
 
 /// Queue `msg` on `ep_id` and wake a blocked receiver, if any.
-pub fn send(ep_id: u64, msg: Message) {
+///
+/// Returns `false` when the endpoint does not exist or its FIFO is full;
+/// the message is then dropped and the caller reports an error. This bound
+/// is what keeps a flooding ring-3 sender from growing the queue without
+/// limit.
+pub fn send(ep_id: u64, msg: Message) -> bool {
     let mut ipc = IPC.lock();
-    if let Some(ep) = ipc.endpoints.iter_mut().find(|e| e.id == ep_id) {
-        ep.queue.push_back(msg);
-        if let Some(tid) = ep.blocked_receiver.take() {
-            drop(ipc);
-            crate::sched::wake_thread(tid);
-        }
+    let Some(ep) = ipc.endpoints.iter_mut().find(|e| e.id == ep_id) else {
+        return false;
+    };
+    if ep.queue.len() >= MAX_QUEUE {
+        return false;
     }
+    ep.queue.push_back(msg);
+    let wake = ep.blocked_receiver.take();
+    drop(ipc);
+    if let Some(tid) = wake {
+        crate::sched::wake_thread(tid);
+    }
+    true
 }
 
 /// Best-effort variant of [`send`] for kernel console mirroring.
@@ -144,17 +159,41 @@ pub fn try_send(ep_id: u64, msg: Message) -> bool {
     true
 }
 
+/// Outcome of a non-blocking receive attempt.
+#[derive(Clone, Copy, Debug)]
+pub enum RecvOutcome {
+    /// A message was dequeued.
+    Message(Message),
+    /// The caller is now the endpoint's blocked receiver.
+    Blocked,
+    /// Another thread is already blocked on this endpoint. NovaX supports
+    /// exactly one blocked receiver, so the caller gets an error instead of
+    /// overwriting (and losing) the existing waiter.
+    Busy,
+    /// No endpoint with this id exists.
+    Invalid,
+}
+
 /// Pop one message from `ep_id`, or register the caller as the blocked
-/// receiver. Returns `None` in the latter case (the caller then blocks).
-pub fn recv(ep_id: u64) -> Option<Message> {
+/// receiver. Returns [`RecvOutcome::Blocked`] in the latter case (the
+/// caller then blocks).
+pub fn recv(ep_id: u64) -> RecvOutcome {
     let mut ipc = IPC.lock();
-    if let Some(ep) = ipc.endpoints.iter_mut().find(|e| e.id == ep_id) {
-        if let Some(msg) = ep.queue.pop_front() {
-            return Some(msg);
-        }
-        ep.blocked_receiver = Some(crate::sched::current_id());
+    let Some(ep) = ipc.endpoints.iter_mut().find(|e| e.id == ep_id) else {
+        return RecvOutcome::Invalid;
+    };
+    if let Some(msg) = ep.queue.pop_front() {
+        return RecvOutcome::Message(msg);
     }
-    None
+    let me = crate::sched::current_id();
+    match ep.blocked_receiver {
+        None => {
+            ep.blocked_receiver = Some(me);
+            RecvOutcome::Blocked
+        }
+        Some(tid) if tid == me => RecvOutcome::Blocked,
+        Some(_) => RecvOutcome::Busy,
+    }
 }
 
 // --- IRQ routing ------------------------------------------------------------
@@ -189,7 +228,9 @@ pub fn deliver_irq(irq: u8) {
     };
     let mut data = [0u8; MAX_MSG_LEN];
     data[0] = irq;
-    send(
+    // A full queue means the driver is not draining its endpoint; the IRQ
+    // line stays masked until it does, so dropping the note is safe.
+    let _ = send(
         ep_id,
         Message {
             data,
