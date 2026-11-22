@@ -25,7 +25,7 @@ const FG: u32 = 0x00E5_E5E5;
 const RED: u32 = 0x00E6_0000;
 const DIM: u32 = 0x002A_2A30;
 
-const BANNER: &[u8] = b"NOVAX v0.1.1 // HEART MICROKERNEL";
+const BANNER: &[u8] = b"NOVAX v0.1.2 // HEART MICROKERNEL";
 
 #[panic_handler]
 fn on_panic(_: &core::panic::PanicInfo) -> ! {
