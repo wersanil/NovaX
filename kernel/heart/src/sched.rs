@@ -121,7 +121,7 @@ pub fn init() {
             is_idle: false,
             wake_pending: false,
             is_user: false,
-            kernel_stack_top: 0,
+            kernel_stack_top: smp::percpu_at(0).boot_stack_top(),
             pml4_phys: 0,
             user_entry: 0,
             user_stack: 0,
@@ -197,7 +197,11 @@ pub fn spawn_on(name: &'static str, entry: EntryFn, cpu: usize) -> ThreadId {
             p.add(3).write(0);
             p.add(4).write(0);
             p.add(5).write(0);
-            p.add(6).write(0x202);
+            // IF=0: `switch_context` restores RFLAGS with `popfq`, and the
+            // scheduler entry path expects interrupts to stay off until the
+            // new thread explicitly enables them. Kernel threads that need
+            // preemption call `sti` themselves (see `demo_worker`).
+            p.add(6).write(0x2);
             p.add(7).write(entry as usize as u64);
         }
 
@@ -251,7 +255,10 @@ pub fn spawn_user(
             p.add(3).write(0);
             p.add(4).write(0);
             p.add(5).write(0);
-            p.add(6).write(0x202);
+            // IF=0: see the comment in `spawn_on`. `user_trampoline` must
+            // not be preempted while it holds the scheduler lock, and
+            // `enter_userspace` raises IF when it builds the ring-3 frame.
+            p.add(6).write(0x2);
             p.add(7).write(crate::user::user_trampoline as usize as u64);
         }
 
