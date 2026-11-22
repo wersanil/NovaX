@@ -3,8 +3,10 @@
 //! `run_all` runs synchronously on the BSP and exits QEMU on success; the
 //! thread test is last because its workers never terminate.
 
-use novax_memory::{MemoryError, NO_EXEC, PRESENT, WRITABLE};
+use novax_memory::{MemoryError, NO_EXEC, PRESENT, USER, WRITABLE};
 
+use crate::ipc::{self, Message, RecvOutcome};
+use crate::user::{self, AddressSpace};
 use crate::{arch, memory_mut, sched, serial_println};
 use core::sync::atomic::{AtomicU32, Ordering};
 
@@ -14,7 +16,10 @@ pub fn run_all() {
     test_frame_alloc_and_free();
     test_frame_alloc_1000();
     test_paging_map_unmap();
+    test_user_range_check();
     test_heap_alloc();
+    test_ipc_queue_bound();
+    test_elf_loader();
     test_breakpoint();
     test_timer_ticks();
     test_threads(); // leaves workers running forever — must be last
@@ -143,6 +148,186 @@ fn test_paging_map_unmap() {
     );
 
     serial_println!("    ok");
+}
+
+fn test_user_range_check() {
+    serial_println!("[test] user range check honours page flags");
+    const VA: u64 = 0x0000_5000_0000;
+
+    let (user_frame, super_frame) = memory_mut(|m| {
+        let user = m.frames.alloc().expect("user frame");
+        let supervisor = m.frames.alloc().expect("supervisor frame");
+        m.paging
+            .map(
+                VA,
+                user.start_address(),
+                PRESENT | USER | WRITABLE | NO_EXEC,
+                &mut m.frames,
+            )
+            .expect("map user page");
+        m.paging
+            .map(
+                VA + 0x1000,
+                supervisor.start_address(),
+                PRESENT | WRITABLE | NO_EXEC,
+                &mut m.frames,
+            )
+            .expect("map supervisor page");
+        (user, supervisor)
+    });
+
+    memory_mut(|m| {
+        assert!(
+            m.paging.check_user_range(VA, 16, false),
+            "user page must be readable"
+        );
+        assert!(
+            m.paging.check_user_range(VA, 16, true),
+            "user page must be writable"
+        );
+        assert!(
+            m.paging.check_user_range(VA, 0x1000, true),
+            "exactly one page is fine"
+        );
+        assert!(
+            !m.paging.check_user_range(VA, 0x1001, true),
+            "a range crossing into a supervisor page must fail"
+        );
+        assert!(
+            !m.paging.check_user_range(VA + 0x1000, 16, false),
+            "supervisor page is not user-accessible"
+        );
+        assert!(
+            !m.paging.check_user_range(VA + 0x2000, 16, false),
+            "unmapped page must fail"
+        );
+        let _ = m.paging.unmap(VA, &mut m.frames);
+        let _ = m.paging.unmap(VA + 0x1000, &mut m.frames);
+        m.frames.free(user_frame);
+        m.frames.free(super_frame);
+    });
+
+    serial_println!("    ok");
+}
+
+fn test_ipc_queue_bound() {
+    serial_println!("[test] ipc queue is bounded and recoverable");
+    let ep = ipc::create_endpoint();
+    let msg = Message {
+        data: [0u8; ipc::MAX_MSG_LEN],
+        len: 0,
+        sender: 0,
+    };
+
+    for i in 0..ipc::MAX_QUEUE {
+        assert!(ipc::send(ep, msg), "queue must accept message {i}");
+    }
+    assert!(
+        !ipc::send(ep, msg),
+        "queue must reject the message after MAX_QUEUE"
+    );
+
+    for _ in 0..ipc::MAX_QUEUE {
+        assert!(
+            matches!(ipc::recv(ep), RecvOutcome::Message(_)),
+            "queued message must be returned"
+        );
+    }
+    assert!(ipc::send(ep, msg), "queue must accept after draining");
+    assert!(matches!(ipc::recv(ep), RecvOutcome::Message(_)));
+
+    serial_println!("    ok");
+}
+
+fn test_elf_loader() {
+    serial_println!("[test] ELF loader rejects malformed input without leaks");
+    let before = memory_mut(|m| m.frames.free_count());
+    let space = AddressSpace::new().expect("address space");
+
+    let valid = valid_test_elf();
+    let ph = 0x40usize;
+
+    let mut bad = valid.clone();
+    bad[54..56].copy_from_slice(&0u16.to_le_bytes()); // e_phentsize = 0
+    assert!(matches!(
+        user::load_elf(&space, &bad),
+        Err(user::UserError::Malformed)
+    ));
+
+    let mut bad = valid.clone();
+    bad[32..40].copy_from_slice(&0x1000u64.to_le_bytes()); // phoff past EOF
+    assert!(matches!(
+        user::load_elf(&space, &bad),
+        Err(user::UserError::Malformed)
+    ));
+
+    let mut bad = valid.clone();
+    bad[ph + 32..ph + 40].copy_from_slice(&2u64.to_le_bytes()); // filesz > memsz
+    assert!(matches!(
+        user::load_elf(&space, &bad),
+        Err(user::UserError::Malformed)
+    ));
+
+    let mut bad = valid.clone();
+    bad[ph + 8..ph + 16].copy_from_slice(&0x100u64.to_le_bytes()); // p_offset past EOF
+    assert!(matches!(
+        user::load_elf(&space, &bad),
+        Err(user::UserError::Malformed)
+    ));
+
+    let mut bad = valid.clone();
+    bad[ph + 16..ph + 24].copy_from_slice(&0xffff_ffff_8000_0000u64.to_le_bytes()); // kernel VA
+    assert!(matches!(
+        user::load_elf(&space, &bad),
+        Err(user::UserError::Malformed)
+    ));
+
+    let mut bad = valid.clone();
+    bad[24..32].copy_from_slice(&0u64.to_le_bytes()); // e_entry = 0
+    assert!(matches!(
+        user::load_elf(&space, &bad),
+        Err(user::UserError::NoEntry)
+    ));
+
+    let entry = user::load_elf(&space, &valid).expect("valid ELF must load");
+    assert_eq!(entry, 0x40_0000);
+
+    space.destroy();
+    let after = memory_mut(|m| m.frames.free_count());
+    assert_eq!(after, before, "ELF load + destroy must not leak frames");
+
+    serial_println!("    ok");
+}
+
+/// Minimal valid ELF64: one R+X PT_LOAD at 0x40_0000 with one file byte.
+fn valid_test_elf() -> alloc::vec::Vec<u8> {
+    const PHOFF: usize = 0x40;
+    const DATA: usize = 0x78;
+
+    let mut elf = alloc::vec![0u8; 0x100];
+    elf[0..4].copy_from_slice(b"\x7FELF");
+    elf[4] = 2; // ELFCLASS64
+    elf[5] = 1; // ELFDATA2LSB
+    elf[6] = 1; // EV_CURRENT
+    elf[16..18].copy_from_slice(&2u16.to_le_bytes()); // ET_EXEC
+    elf[18..20].copy_from_slice(&62u16.to_le_bytes()); // EM_X86_64
+    elf[20..24].copy_from_slice(&1u32.to_le_bytes()); // e_version
+    elf[24..32].copy_from_slice(&0x40_0000u64.to_le_bytes()); // e_entry
+    elf[32..40].copy_from_slice(&(PHOFF as u64).to_le_bytes()); // e_phoff
+    elf[52..54].copy_from_slice(&64u16.to_le_bytes()); // e_ehsize
+    elf[54..56].copy_from_slice(&56u16.to_le_bytes()); // e_phentsize
+    elf[56..58].copy_from_slice(&1u16.to_le_bytes()); // e_phnum
+
+    elf[PHOFF..PHOFF + 4].copy_from_slice(&1u32.to_le_bytes()); // PT_LOAD
+    elf[PHOFF + 4..PHOFF + 8].copy_from_slice(&5u32.to_le_bytes()); // PF_R | PF_X
+    elf[PHOFF + 8..PHOFF + 16].copy_from_slice(&(DATA as u64).to_le_bytes());
+    elf[PHOFF + 16..PHOFF + 24].copy_from_slice(&0x40_0000u64.to_le_bytes()); // p_vaddr
+    elf[PHOFF + 24..PHOFF + 32].copy_from_slice(&0x40_0000u64.to_le_bytes()); // p_paddr
+    elf[PHOFF + 32..PHOFF + 40].copy_from_slice(&1u64.to_le_bytes()); // p_filesz
+    elf[PHOFF + 40..PHOFF + 48].copy_from_slice(&1u64.to_le_bytes()); // p_memsz
+    elf[PHOFF + 48..PHOFF + 56].copy_from_slice(&0x1000u64.to_le_bytes()); // p_align
+    elf[DATA] = 0xC3; // ret
+    elf
 }
 
 fn test_heap_alloc() {
