@@ -68,8 +68,8 @@ static KERNEL_PML4_PHYS: AtomicU64 = AtomicU64::new(0);
 
 // --- Public API -------------------------------------------------------------
 
-/// Bring up this CPU's GDT/TSS/IDT, mask the legacy PIC, program the
-/// IOAPIC, start the LAPIC timer, and configure MSRs for `syscall`.
+/// Bring up this CPU's GDT/TSS/IDT, mask the legacy PIC, map the LAPIC,
+/// program the IOAPIC, and configure MSRs for `syscall`.
 pub fn init() {
     // Establish our own GDT/CS first: `set_handler_fn` records the CS
     // selector that is current when the IDT is built.
@@ -77,8 +77,10 @@ pub fn init() {
     init_idt();
     load_idt();
     init_pic();
-    init_ioapic();
+    // The LAPIC must be mapped and its id published before the IOAPIC
+    // entries are steered to this CPU.
     init_lapic();
+    init_ioapic();
     init_syscalls();
     smp::discover();
 }
@@ -163,10 +165,14 @@ fn init_idt() {
         let mut idt = InterruptDescriptorTable::new();
 
         idt.breakpoint.set_handler_fn(breakpoint_handler);
+        idt.divide_error.set_handler_fn(divide_error_handler);
         idt.invalid_opcode.set_handler_fn(invalid_opcode_handler);
+        idt.stack_segment_fault
+            .set_handler_fn(stack_segment_fault_handler);
         idt.general_protection_fault
             .set_handler_fn(general_protection_handler);
         idt.page_fault.set_handler_fn(page_fault_handler);
+        idt.alignment_check.set_handler_fn(alignment_check_handler);
 
         // WHY unsafe: `set_stack_index` is unsafe because a bad index
         // would let the CPU load a garbage rsp on a fault. Index 1 is
@@ -240,12 +246,18 @@ fn init_ioapic() {
 
     let version = ioapic_read(IOAPIC_REG_VER);
     let max_entry = ((version >> 16) & 0xFF) as u8;
+
+    // `init_lapic` runs first and publishes the real BSP LAPIC id; using
+    // the default 0 here would steer every IRQ to a non-existent CPU on
+    // hardware whose BSP is not CPU 0.
+    let bsp_lapic = smp::bsp_lapic_id() as u8;
+
     for gsi in 0..=max_entry {
-        ioapic_write_entry(gsi, 0, smp::bsp_lapic_id() as u8, true);
+        ioapic_write_entry(gsi, 0, bsp_lapic, true);
     }
     // Pre-program the two lines the userspace drivers own, still masked.
-    ioapic_write_entry(1, KBD_VECTOR, smp::bsp_lapic_id() as u8, true);
-    ioapic_write_entry(4, SERIAL_VECTOR, smp::bsp_lapic_id() as u8, true);
+    ioapic_write_entry(1, KBD_VECTOR, bsp_lapic, true);
+    ioapic_write_entry(4, SERIAL_VECTOR, bsp_lapic, true);
 
     serial_println!(
         "ioapic: id={}, version={:#x}, entries={}",
@@ -363,8 +375,8 @@ fn init_lapic() {
 
     LAPIC_VIRT.store(LAPIC_VIRT_BASE, Ordering::Release);
 
-    // Publish the BSP's APIC id before the IOAPIC is programmed (the
-    // IOAPIC entries are steered to the BSP).
+    // Publish the BSP's APIC id so `init_ioapic` (which runs next) can
+    // steer every redirection entry to this CPU.
     let mmio = LAPIC_VIRT_BASE as *mut u8;
     // WHY unsafe: reading our own LAPIC ID register after mapping.
     let id = unsafe { read_reg(mmio, LAPIC_REG_ID) >> 24 };
@@ -459,14 +471,56 @@ extern "x86-interrupt" fn breakpoint_handler(frame: InterruptStackFrame) {
     );
 }
 
+/// True when the interrupted context was ring 3.
+fn from_user(frame: &InterruptStackFrame) -> bool {
+    frame.code_segment.rpl() == PrivilegeLevel::Ring3
+}
+
+/// A ring-3 exception must not take the kernel down: terminate the faulty
+/// thread and let the scheduler pick another one. Faults from ring 0 still
+/// panic, because they indicate a kernel bug.
+fn kill_user_thread(what: &str, frame: &InterruptStackFrame) -> ! {
+    serial_println!(
+        "user fault: {} at rip={:#x} rsp={:#x}",
+        what,
+        frame.instruction_pointer.as_u64(),
+        frame.stack_pointer.as_u64()
+    );
+    crate::sched::exit_current()
+}
+
+extern "x86-interrupt" fn divide_error_handler(frame: InterruptStackFrame) {
+    if from_user(&frame) {
+        kill_user_thread("divide error", &frame);
+    }
+    panic!("divide error at {:#x}", frame.instruction_pointer.as_u64());
+}
+
 extern "x86-interrupt" fn invalid_opcode_handler(frame: InterruptStackFrame) {
+    if from_user(&frame) {
+        kill_user_thread("invalid opcode", &frame);
+    }
     panic!(
         "invalid opcode at {:#x}",
         frame.instruction_pointer.as_u64()
     );
 }
 
+extern "x86-interrupt" fn stack_segment_fault_handler(frame: InterruptStackFrame, error_code: u64) {
+    if from_user(&frame) {
+        kill_user_thread("stack segment fault", &frame);
+    }
+    panic!(
+        "stack segment fault: error={:#x} rip={:#x}",
+        error_code,
+        frame.instruction_pointer.as_u64()
+    );
+}
+
 extern "x86-interrupt" fn general_protection_handler(frame: InterruptStackFrame, error_code: u64) {
+    if from_user(&frame) {
+        kill_user_thread("general protection", &frame);
+    }
     panic!(
         "general protection fault: error={:#x} rip={:#x}",
         error_code,
@@ -483,9 +537,29 @@ extern "x86-interrupt" fn page_fault_handler(
     unsafe {
         asm!("mov {}, cr2", out(reg) cr2, options(nostack, preserves_flags));
     }
+    if from_user(&frame) {
+        serial_println!(
+            "user page fault: addr={:#x} err={:?} rip={:#x}",
+            cr2,
+            error_code,
+            frame.instruction_pointer.as_u64()
+        );
+        crate::sched::exit_current();
+    }
     panic!(
         "page fault: addr={:#x} err={:?} rip={:#x}",
         cr2,
+        error_code,
+        frame.instruction_pointer.as_u64()
+    );
+}
+
+extern "x86-interrupt" fn alignment_check_handler(frame: InterruptStackFrame, error_code: u64) {
+    if from_user(&frame) {
+        kill_user_thread("alignment check", &frame);
+    }
+    panic!(
+        "alignment check: error={:#x} rip={:#x}",
         error_code,
         frame.instruction_pointer.as_u64()
     );
