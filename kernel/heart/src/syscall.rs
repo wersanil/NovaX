@@ -4,8 +4,10 @@
 //! Errors are reported as `u64::MAX` (ENOSYS-style); the kernel internals
 //! use `Result` and only convert at this boundary.
 
-use crate::ipc::{self, CapKind, Message, CAP_NOTIFY, CAP_READ, CAP_WRITE};
+use crate::ipc::{self, CapKind, Message, CAP_NOTIFY, CAP_READ, CAP_WRITE, MAX_MSG_LEN};
+use crate::memory_mut;
 use crate::sched;
+use novax_memory::PageTableRef;
 
 const SYS_EXIT: u64 = 0;
 const SYS_WRITE: u64 = 1;
@@ -81,7 +83,7 @@ fn sys_send(cap_idx: u64, ptr: u64, len: u64) -> u64 {
     match sched::get_current_cap(cap_idx) {
         Some(c) if c.rights & CAP_WRITE != 0 => match c.kind {
             CapKind::Endpoint(id) => {
-                ipc::send(
+                let queued = ipc::send(
                     id,
                     Message {
                         data: buf,
@@ -89,7 +91,11 @@ fn sys_send(cap_idx: u64, ptr: u64, len: u64) -> u64 {
                         sender: sched::current_id(),
                     },
                 );
-                len
+                if queued {
+                    len
+                } else {
+                    u64::MAX
+                }
             }
             _ => u64::MAX,
         },
@@ -98,17 +104,26 @@ fn sys_send(cap_idx: u64, ptr: u64, len: u64) -> u64 {
 }
 
 fn sys_recv(cap_idx: u64, ptr: u64, max_len: u64) -> u64 {
+    // Validate the destination before dequeuing anything: a bad pointer
+    // must not consume (and lose) a message.
+    let want = core::cmp::min(max_len, MAX_MSG_LEN as u64);
+    if !user_range_ok(ptr, want, true) {
+        return u64::MAX;
+    }
     match sched::get_current_cap(cap_idx) {
         Some(c) if c.rights & CAP_READ != 0 => match c.kind {
             CapKind::Endpoint(id) => loop {
-                if let Some(msg) = ipc::recv(id) {
-                    let n = core::cmp::min(msg.len, max_len as usize);
-                    if copy_to_user(ptr, &msg.data[..n]).is_err() {
-                        return u64::MAX;
+                match ipc::recv(id) {
+                    ipc::RecvOutcome::Message(msg) => {
+                        let n = core::cmp::min(msg.len, max_len as usize);
+                        if copy_to_user(ptr, &msg.data[..n]).is_err() {
+                            return u64::MAX;
+                        }
+                        return n as u64;
                     }
-                    return n as u64;
+                    ipc::RecvOutcome::Blocked => sched::block_current(),
+                    ipc::RecvOutcome::Busy | ipc::RecvOutcome::Invalid => return u64::MAX,
                 }
-                sched::block_current();
             },
             _ => u64::MAX,
         },
@@ -174,15 +189,16 @@ fn sys_irq_ack(irq_idx: u64) -> u64 {
 }
 
 /// Resolve an (io-cap, offset) pair to a physical port, enforcing that
-/// the offset stays inside the capability's window.
-fn io_port(cap_idx: u64, offset: u64, right: u32) -> Option<u16> {
+/// the whole access (`width` bytes) stays inside the capability window.
+fn io_port(cap_idx: u64, offset: u64, right: u32, width: u64) -> Option<u16> {
     let c = sched::get_current_cap(cap_idx)?;
     if c.rights & right == 0 {
         return None;
     }
     match c.kind {
         CapKind::IoPort { base, len } => {
-            if offset >= len as u64 {
+            let end = offset.checked_add(width)?;
+            if end > len as u64 {
                 return None;
             }
             base.checked_add(offset as u16)
@@ -192,7 +208,7 @@ fn io_port(cap_idx: u64, offset: u64, right: u32) -> Option<u16> {
 }
 
 fn sys_inb(cap_idx: u64, offset: u64) -> u64 {
-    match io_port(cap_idx, offset, CAP_READ) {
+    match io_port(cap_idx, offset, CAP_READ, 1) {
         Some(port) => {
             // WHY unsafe: port I/O is privileged; the capability has
             // already bounded `port` to the granted window.
@@ -210,7 +226,7 @@ fn sys_inb(cap_idx: u64, offset: u64) -> u64 {
 }
 
 fn sys_outb(cap_idx: u64, offset: u64, value: u64) -> u64 {
-    match io_port(cap_idx, offset, CAP_WRITE) {
+    match io_port(cap_idx, offset, CAP_WRITE, 1) {
         Some(port) => {
             // WHY unsafe: same contract as sys_inb.
             unsafe {
@@ -226,7 +242,7 @@ fn sys_outb(cap_idx: u64, offset: u64, value: u64) -> u64 {
 }
 
 fn sys_inw(cap_idx: u64, offset: u64) -> u64 {
-    match io_port(cap_idx, offset, CAP_READ) {
+    match io_port(cap_idx, offset, CAP_READ, 2) {
         Some(port) => {
             // WHY unsafe: privileged port I/O inside the granted window.
             let v: u16;
@@ -243,7 +259,7 @@ fn sys_inw(cap_idx: u64, offset: u64) -> u64 {
 }
 
 fn sys_outw(cap_idx: u64, offset: u64, value: u64) -> u64 {
-    match io_port(cap_idx, offset, CAP_WRITE) {
+    match io_port(cap_idx, offset, CAP_WRITE, 2) {
         Some(port) => {
             // WHY unsafe: same contract as `sys_inw`.
             unsafe {
@@ -259,7 +275,7 @@ fn sys_outw(cap_idx: u64, offset: u64, value: u64) -> u64 {
 }
 
 fn sys_inl(cap_idx: u64, offset: u64) -> u64 {
-    match io_port(cap_idx, offset, CAP_READ) {
+    match io_port(cap_idx, offset, CAP_READ, 4) {
         Some(port) => {
             // WHY unsafe: privileged port I/O inside the granted window.
             let v: u32;
@@ -276,7 +292,7 @@ fn sys_inl(cap_idx: u64, offset: u64) -> u64 {
 }
 
 fn sys_outl(cap_idx: u64, offset: u64, value: u64) -> u64 {
-    match io_port(cap_idx, offset, CAP_WRITE) {
+    match io_port(cap_idx, offset, CAP_WRITE, 4) {
         Some(port) => {
             // WHY unsafe: same contract as `sys_inl`.
             unsafe {
@@ -337,20 +353,45 @@ fn sys_map_mmio(cap_idx: u64, out_ptr: u64) -> u64 {
     }
 }
 
+/// Check that `[ptr, ptr + len)` is mapped for ring 3 in the current
+/// address space with the requested write permission.
+///
+/// This is the syscall-boundary guard: a user pointer is only dereferenced
+/// after every page it touches has been walked and its `USER`/`WRITABLE`
+/// bits checked, so an unmapped or supervisor-only address returns an
+/// error instead of faulting in ring 0.
+pub fn user_range_ok(ptr: u64, len: u64, write: bool) -> bool {
+    const USER_MAX: u64 = 0x0000_8000_0000_0000;
+    if len == 0 {
+        return true;
+    }
+    let Some(end) = ptr.checked_add(len) else {
+        return false;
+    };
+    if ptr >= USER_MAX || end > USER_MAX {
+        return false;
+    }
+    let pml4 = sched::current_pml4_phys();
+    if pml4 == 0 {
+        return false;
+    }
+    let hhdm = memory_mut(|m| m.frames.hhdm());
+    PageTableRef::from_phys(pml4, hhdm).check_user_range(ptr, len, write)
+}
+
 /// Copy `dst.len()` bytes from the user address `src`.
 ///
-/// Only range-checks against the user half; the kernel has no SMAP, so a
-/// bad pointer is a kernel fault (documented v0.1.1 limitation).
+/// The range is checked against the current address space before the copy;
+/// a pointer to an unmapped page is rejected. The kernel still has no SMAP,
+/// so a concurrent unmap would be a kernel fault, but NovaX has no unmap
+/// syscall and pins each process to one CPU.
 pub fn copy_from_user(dst: &mut [u8], src: u64) -> Result<(), ()> {
-    const USER_MAX: u64 = 0x0000_8000_0000_0000;
-    let end = src.checked_add(dst.len() as u64).ok_or(())?;
-    if src >= USER_MAX || end > USER_MAX {
+    if !user_range_ok(src, dst.len() as u64, false) {
         return Err(());
     }
     for (i, b) in dst.iter_mut().enumerate() {
-        // SAFETY: the range was bounds-checked against USER_MAX above; the
-        // kernel has no SMAP, so a user page is readable from ring 0. A bad
-        // pointer is still a kernel fault (see the v0.1.1 limitations).
+        // SAFETY: the range was checked against the current PML4 above; the
+        // kernel has no SMAP, so a user page is readable from ring 0.
         unsafe { *b = core::ptr::read_volatile((src + i as u64) as *const u8) };
     }
     Ok(())
@@ -358,16 +399,15 @@ pub fn copy_from_user(dst: &mut [u8], src: u64) -> Result<(), ()> {
 
 /// Copy `src` to the user address `dst`.
 ///
-/// Same range-check contract as [`copy_from_user`].
+/// Same contract as [`copy_from_user`], plus a `WRITABLE` check on every
+/// page.
 pub fn copy_to_user(dst: u64, src: &[u8]) -> Result<(), ()> {
-    const USER_MAX: u64 = 0x0000_8000_0000_0000;
-    let end = dst.checked_add(src.len() as u64).ok_or(())?;
-    if dst >= USER_MAX || end > USER_MAX {
+    if !user_range_ok(dst, src.len() as u64, true) {
         return Err(());
     }
     for (i, b) in src.iter().enumerate() {
-        // SAFETY: same contract as `copy_from_user`: range checked, one byte
-        // per access, user pages are writable without SMAP.
+        // SAFETY: same contract as `copy_from_user`: the range is mapped
+        // writable for ring 3, one byte per access.
         unsafe {
             core::ptr::write_volatile((dst + i as u64) as *mut u8, *b);
         }
