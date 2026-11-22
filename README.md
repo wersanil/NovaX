@@ -16,7 +16,7 @@
   <a href="https://github.com"><img alt="FreeMind Soft" src="https://img.shields.io/badge/FreeMind_Soft-project-39ff14?style=flat-square&labelColor=0b0f14"></a>
 </p>
 
-<p align="center"><sub>v0.1.1 · Ring-3 Framebuffer & Capability Microkernel · <a href="docs/ARCHITECTURE.md">Architecture</a></sub></p>
+<p align="center"><sub>v0.1.2 · Ring-3 Framebuffer & Capability Microkernel · <a href="docs/ARCHITECTURE.md">Architecture</a></sub></p>
 
 ---
 
@@ -174,31 +174,57 @@ docs/              architecture notes and assets
 
 Deep dive: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
-## // 05 — STATUS
+## // 05 — WHAT'S NEW IN v0.1.2
 
-v0.1.1 is a working research kernel, not a general-purpose OS.
+v0.1.2 is a security and correctness release. No ABI changes; all
+existing ring-3 servers keep working.
+
+- **Hardened ELF loader** — program headers, file ranges and virtual
+  ranges are validated before a single frame is allocated; segments must
+  stay in the user half and outside the stack/DMA/MMIO windows; a failed
+  load frees every frame and page table it created.
+- **Checked user pointers** — `SYS_WRITE/SEND/RECV/DMA_ALLOC/MAP_MMIO`
+  walk the current PML4 and require `USER` (and `WRITABLE` for output)
+  before touching a pointer. Bad pointers return an error instead of
+  faulting in ring 0.
+- **Ring-3 fault isolation** — `#PF/#GP/#UD/#DE/#SS/#AC` from ring 3
+  terminate the faulty thread; the kernel no longer panics on a driver
+  bug.
+- **Bounded IPC** — endpoint FIFOs are capped at 1024 messages, and a
+  second blocked receiver gets an explicit error instead of overwriting
+  the first one.
+- **SMP hardening** — new threads start with interrupts disabled, AP idle
+  uses `cli; schedule; sti; hlt`, and the IOAPIC is programmed with the
+  real BSP LAPIC id.
+- **Paging/IO guards** — huge-page entries are rejected during map/unmap,
+  port-I/O accesses are checked against the full capability window, and
+  DMA/MMIO validate the result pointer before mapping.
+
+## // 06 — STATUS
+
+v0.1.2 is a working research kernel, not a general-purpose OS.
 
 - Graphics runs over the boot-time GOP/VBE linear framebuffer via userspace/fb (no runtime modesetting or 2D/3D hardware acceleration yet).
 - Legacy virtio only; the net driver polls the used ring (no MSI-X).
 - Networking is ARP + ICMP only; no DHCP, UDP or TCP.
 - No process model (fork/exec/wait), no VFS, no ACPI, no SMAP/SMEP.
-- Fixed limits: 16 caps per thread, 64-byte messages, 8 CPUs, one DMA window.
+- Fixed limits: 16 caps per thread, 64-byte messages, 1024-message queues, 8 CPUs, one DMA window.
 
 These are deliberate scope choices for an auditable core, not hidden
 shortcuts. The full list lives in the architecture document.
 
-## // 06 — FREEMIND SOFT
+## // 07 — FREEMIND SOFT
 
 > **FreeMind Soft** — systems software, low-level engineering, open source.
 
 - Author: [GitHub profile](https://github.com/wersanil) <!-- TODO: replace with the author profile URL -->
 - Telegram: [FreeMind Soft Telegram](https://t.me/freemind_soft) <!-- TODO: replace with the channel URL -->
 
-## // 07 — LICENSE
+## // 08 — LICENSE
 
 NovaX is released under the GNU General Public License v3.0.
 See [LICENSE](LICENSE).
 
 ---
 
-<p align="center"><sub>NovaX v0.1.1 · FreeMind Soft · small kernel, explicit authority</sub></p>
+<p align="center"><sub>NovaX v0.1.2 · FreeMind Soft · small kernel, explicit authority</sub></p>
