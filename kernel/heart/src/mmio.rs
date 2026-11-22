@@ -50,6 +50,10 @@ pub fn map_for_current(paddr: u64, len: u64, out_ptr: u64) -> Result<(), MmioErr
     if pml4 == 0 {
         return Err(MmioError::NotUserThread);
     }
+    // Validate the result pointer before mapping the window.
+    if !crate::syscall::user_range_ok(out_ptr, 24, true) {
+        return Err(MmioError::BadOutPtr);
+    }
 
     memory_mut(|m| {
         let hhdm = m.frames.hhdm();
