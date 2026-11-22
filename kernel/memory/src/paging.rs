@@ -111,6 +111,57 @@ impl PageTableRef {
         Ok(val & ADDR_MASK)
     }
 
+    /// Check that every 4 KiB page covering `[virt, virt + len)` is mapped
+    /// for ring 3 with the requested write permission.
+    ///
+    /// Huge pages are treated as inaccessible on purpose: NovaX only ever
+    /// maps user memory with 4 KiB pages, so a huge entry below `USER_MAX`
+    /// is a kernel bug rather than a valid user mapping. This function is
+    /// used at the syscall boundary before touching a user pointer.
+    pub fn check_user_range(&self, virt: u64, len: u64, write: bool) -> bool {
+        if len == 0 {
+            return true;
+        }
+        let Some(end) = virt.checked_add(len) else {
+            return false;
+        };
+        let mut page = virt & !(FRAME_SIZE - 1);
+        while page < end {
+            let Some(entry) = self.leaf_entry(page) else {
+                return false;
+            };
+            if entry & USER == 0 || (write && entry & WRITABLE == 0) {
+                return false;
+            }
+            let Some(next) = page.checked_add(FRAME_SIZE) else {
+                return false;
+            };
+            page = next;
+        }
+        true
+    }
+
+    /// Return the leaf PTE for `virt`, or `None` when it is absent or the
+    /// walk encounters a huge page (which we refuse to split).
+    fn leaf_entry(&self, virt: u64) -> Option<u64> {
+        let mut table_phys = self.phys;
+        for level in 0..4 {
+            let idx = (virt >> (39 - 9 * level)) & 0x1FF;
+            let entry = self.read_entry(table_phys, idx);
+            if entry & PRESENT == 0 {
+                return None;
+            }
+            if level < 3 && entry & HUGE != 0 {
+                return None;
+            }
+            if level == 3 {
+                return Some(entry);
+            }
+            table_phys = entry & ADDR_MASK;
+        }
+        None
+    }
+
     /// Return the physical address backing `virt`, if any.
     pub fn translate(&self, virt: u64) -> Option<u64> {
         let mut table_phys = self.phys;
@@ -161,6 +212,11 @@ impl PageTableRef {
                 }
                 // Intermediate entries: present + writable + user.
                 *entry = new_phys | PRESENT | WRITABLE | USER;
+            } else if *entry & HUGE != 0 {
+                // A huge page cannot be used as the next-level table: the
+                // entry holds a physical page frame, not a table pointer.
+                // Writing through it would corrupt unrelated memory.
+                return Err(MemoryError::HugePage);
             }
             table_phys = *entry & ADDR_MASK;
         }
@@ -177,6 +233,9 @@ impl PageTableRef {
             let entry = self.read_entry(table_phys, idx);
             if entry & PRESENT == 0 {
                 return Err(MemoryError::NotMapped);
+            }
+            if entry & HUGE != 0 {
+                return Err(MemoryError::HugePage);
             }
             table_phys = entry & ADDR_MASK;
         }
