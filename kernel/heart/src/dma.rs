@@ -45,6 +45,11 @@ pub fn alloc_for_current(len: u32, out_ptr: u64) -> Result<(), DmaError> {
     if pml4 == 0 {
         return Err(DmaError::NotUserThread);
     }
+    // Validate the result pointer before allocating or mapping anything;
+    // otherwise a bad pointer would leave the DMA window mapped.
+    if !crate::syscall::user_range_ok(out_ptr, 16, true) {
+        return Err(DmaError::BadOutPtr);
+    }
 
     let phys = memory_mut(|m| {
         let hhdm = m.frames.hhdm();
