@@ -1,4 +1,4 @@
-# NovaX — Architecture & Project Summary (v0.1.1, Milestones 0–10)
+# NovaX — Architecture & Project Summary (v0.1.2, Milestones 0–10)
 
 Microkernel OS for x86_64. `Heart` keeps only what cannot live in userspace:
 memory, scheduling, IPC, syscalls, IRQ routing. Drivers and services are
@@ -160,7 +160,7 @@ Errors return `u64::MAX`; kernel internals use `Result<T, E>`.
 Path: keyboard/COM1 → `serial` → `shell_in_ep` → `shell` → `init_ep` →
 `init` → `reply_ep` → `shell` → console via `SYS_WRITE` (COM1 and,
 when present, the fb console).
-### Framebuffer console (v0.1.1)
+### Framebuffer console (since v0.1.1)
 
 The kernel requests a Limine framebuffer and grants the `fb` server:
 
@@ -172,7 +172,7 @@ The kernel requests a Limine framebuffer and grants the `fb` server:
 `fb` calls `SYS_MAP_MMIO`, receives `{virt, paddr, len}`, then renders a
 text console with an embedded 8x16 ASCII font. The style is NovaX
 cybercore: `#0A0A0C` background, a red `#E60000` banner
-`NOVAX v0.1.1 // HEART MICROKERNEL`, and `#E5E5E5` text. The banner and a
+`NOVAX v0.1.2 // HEART MICROKERNEL`, and `#E5E5E5` text. The banner and a
 separator stay pinned to the top; the log area below scrolls when full.
 Supported formats are 32/24/16 bpp with RGB masks from `FbInfo`; any
 other format makes `fb` log an error and exit instead of panicking.
@@ -264,20 +264,23 @@ net: ping 10.0.2.2 seq=1 ok
 net: ping 10.0.2.2 ok
 ```
 
-### Release polish (v0.1.1)
+### Release polish (v0.1.2)
 
-- Limine framebuffer request with a headless fallback; no panic when the
-  bootloader has no display.
-- New `Mmio { paddr, len }` capability and `SYS_MAP_MMIO`; physical video
-  memory is mapped only into the fb server's PML4, uncached and NX.
-- Ring-3 `fb` server: 8x16 ASCII font, NovaX cybercore palette, pinned
-  banner, scrolling log area.
-- Kernel console mirror with boot-log replay and strictly best-effort
-  `try_send` delivery; serial remains authoritative.
-- `tools/qemu_gui.sh` for a graphical QEMU window; all five existing
-  QEMU checks remain green.
+- Hardened ELF loader: all program headers and ranges are validated before
+  allocation; segments are restricted to the user half and kept out of the
+  stack/DMA/MMIO windows; failed loads free their frames and tables.
+- Checked user pointers at every syscall boundary (`USER`/`WRITABLE` page
+  walk); invalid pointers return `u64::MAX` instead of faulting in ring 0.
+- Ring-3 `#PF/#GP/#UD/#DE/#SS/#AC` terminate the faulting thread; ring-0
+  faults still panic.
+- Endpoint FIFOs are capped at 1024 messages; a second blocked receiver is
+  reported as an error instead of overwriting the first.
+- New threads start with `IF=0`, AP idle runs `cli; schedule; sti; hlt`,
+  and the IOAPIC uses the real BSP LAPIC id.
+- Huge-page entries are rejected during map/unmap; port-I/O width and
+  DMA/MMIO result pointers are validated.
 
-## 5. Limitations (v0.1.1)
+## 5. Limitations (v0.1.2)
 
 - **One linear framebuffer**: no multi-monitor, no mode setting, no
   double buffering; `fb` writes directly to the MMIO window.
