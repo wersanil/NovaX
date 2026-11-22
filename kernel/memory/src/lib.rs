@@ -72,6 +72,9 @@ pub enum MemoryError {
     AlreadyMapped,
     /// The leaf page-table entry is not present.
     NotMapped,
+    /// An intermediate entry is a huge page; it cannot be treated as a
+    /// pointer to the next table without corrupting unrelated memory.
+    HugePage,
     /// Address is outside the supported range.
     InvalidAddress,
     /// 5-level paging (LA57) is enabled; unsupported.
