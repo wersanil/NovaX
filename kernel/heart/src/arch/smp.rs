@@ -131,6 +131,7 @@ pub fn current() -> &'static PerCpu {
 }
 
 /// Local APIC id of the bootstrap processor.
+#[cfg_attr(feature = "test", allow(dead_code))]
 pub fn bsp_lapic_id() -> u64 {
     PER_CPU[0].lapic_id.load(Ordering::Acquire)
 }
@@ -259,12 +260,15 @@ extern "C" fn ap_main(slot: u64) -> ! {
     PER_CPU[idx].online.store(true, Ordering::Release);
     crate::serial_println!("ap{}: online", idx);
 
-    x86_64::instructions::interrupts::enable();
     loop {
+        // `schedule` requires IF=0: a timer tick while the scheduler lock
+        // is held would self-deadlock on this CPU.
+        x86_64::instructions::interrupts::disable();
         crate::sched::schedule();
-        // WHY unsafe: idle CPU parks until the next interrupt.
+        // WHY unsafe: `sti; hlt` is the atomic idle sequence; the CPU wakes
+        // on the next interrupt with IF=1 and the handler returns here.
         unsafe {
-            asm!("hlt", options(nomem, nostack, preserves_flags));
+            asm!("sti; hlt", options(nomem, nostack));
         }
     }
 }
