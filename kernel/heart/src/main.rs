@@ -213,7 +213,7 @@ pub extern "C" fn _start() -> ! {
             let fb_info_ep = ipc::create_endpoint();
             let fb_console_ep = ipc::create_endpoint();
 
-            ipc::send(
+            let _ = ipc::send(
                 fb_info_ep,
                 ipc::Message {
                     data: {
@@ -385,6 +385,12 @@ extern "C" fn demo_b() {
 fn demo_worker(name: &'static str) -> ! {
     let cpu = arch::smp::cpu_index();
     crate::serial_println!("smp: worker {} running on cpu {}", name, cpu);
+    // Kernel threads start with IF=0 (see `spawn_on`); this spin is long
+    // enough to matter, so let the timer preempt it.
+    // WHY unsafe: `sti` is privileged and we are in ring 0.
+    unsafe {
+        asm!("sti", options(nomem, nostack, preserves_flags));
+    }
     // Keep the thread alive long enough for the other CPU to pick up its
     // own worker, making the concurrency observable in the log order.
     for _ in 0..20_000_000u32 {
