@@ -4,14 +4,21 @@ build/
 *.iso
 *.log
 *.sock
+kernel/memory/Cargo.lock
 
-# Fetched bootloader payload. `boot/limine/linker.ld` and
-# `boot/limine/limine.conf` are already tracked and stay in the repo.
-boot/limine/
+# Fetched bootloader payload. The two project files below stay tracked.
+boot/limine/*
+!boot/limine/limine.conf
+!boot/limine/linker.ld
 
 # Vendored sources and local history
 third_party/
 git_commits/
 
-# Internal working notes
+# Internal working notes (kept locally, never published)
 agen_mem.txt
+bug.md
+v02.md
+novax.txt
+prompt.md
+docs/assets/*~
