@@ -7,7 +7,7 @@ use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use spin::Once;
 use x86_64::instructions::segmentation::{Segment, CS, DS, ES, SS};
 use x86_64::instructions::tables::load_tss;
-use x86_64::registers::control::Cr3;
+use x86_64::registers::control::{Cr3, Cr3Flags};
 use x86_64::structures::gdt::{Descriptor, GlobalDescriptorTable, SegmentSelector};
 use x86_64::structures::idt::{InterruptDescriptorTable, InterruptStackFrame, PageFaultErrorCode};
 use x86_64::structures::tss::TaskStateSegment;
@@ -15,6 +15,7 @@ use x86_64::PrivilegeLevel;
 use x86_64::VirtAddr;
 
 use crate::arch::smp;
+use crate::sched::ThreadId;
 use crate::{memory_mut, serial_println};
 use novax_memory::{NO_EXEC, PCD, PRESENT, PWT, WRITABLE};
 
@@ -46,6 +47,8 @@ const IA32_GS_BASE: u32 = 0xC000_0101;
 const TIMER_VECTOR: u8 = 32;
 /// Inter-processor reschedule IPI.
 pub const RESCHED_VECTOR: u8 = 0x30;
+/// Inter-processor TLB shootdown IPI.
+pub const TLB_VECTOR: u8 = 0x31;
 /// Legacy PIC IRQ1 (PS/2 keyboard) after the 8259 remap to 0x20..0x2F.
 const KBD_VECTOR: u8 = 33;
 /// Legacy PIC IRQ4 (COM1) after the remap.
@@ -65,6 +68,9 @@ pub static IOAPIC_VIRT: AtomicU64 = AtomicU64::new(0);
 pub static TICKS: AtomicU32 = AtomicU32::new(0);
 
 static KERNEL_PML4_PHYS: AtomicU64 = AtomicU64::new(0);
+
+/// Per-CPU TLB shootdown mailbox: the PML4 physical base to flush.
+static TLB_MAILBOX: [AtomicU64; smp::MAX_CPUS] = [const { AtomicU64::new(0) }; smp::MAX_CPUS];
 
 // --- Public API -------------------------------------------------------------
 
@@ -185,6 +191,7 @@ fn init_idt() {
 
         idt[TIMER_VECTOR].set_handler_fn(timer_handler);
         idt[RESCHED_VECTOR].set_handler_fn(resched_handler);
+        idt[TLB_VECTOR].set_handler_fn(tlb_handler);
         idt[KBD_VECTOR].set_handler_fn(keyboard_irq_handler);
         idt[SERIAL_VECTOR].set_handler_fn(serial_irq_handler);
 
@@ -349,6 +356,26 @@ pub fn send_ipi(dest_lapic: u8, vector: u8) {
     }
 }
 
+/// Flush stale TLB entries for `pml4` on the CPU that owns `owner`.
+///
+/// The unmapping itself already executed `invlpg` on the calling CPU. A
+/// different CPU only needs to reload CR3 if it is currently running the
+/// affected address space.
+pub fn flush_tlb_remote(owner: ThreadId, pml4: u64) {
+    if pml4 == 0 {
+        return;
+    }
+    let Some(cpu) = crate::sched::cpu_of(owner) else {
+        return;
+    };
+    if cpu >= smp::MAX_CPUS || cpu == smp::cpu_index() {
+        return;
+    }
+    TLB_MAILBOX[cpu].store(pml4, Ordering::Release);
+    let lapic = smp::percpu_at(cpu).lapic_id.load(Ordering::Acquire) as u8;
+    send_ipi(lapic, TLB_VECTOR);
+}
+
 /// Raw byte write to a port. Caller owns the port (ring 0 only).
 #[inline]
 pub(crate) unsafe fn outb(port: u16, val: u8) {
@@ -486,6 +513,7 @@ fn kill_user_thread(what: &str, frame: &InterruptStackFrame) -> ! {
         frame.instruction_pointer.as_u64(),
         frame.stack_pointer.as_u64()
     );
+    crate::ipc::process_died(crate::sched::current_id(), crate::ipc::DeathReason::Fault);
     crate::sched::exit_current()
 }
 
@@ -544,6 +572,7 @@ extern "x86-interrupt" fn page_fault_handler(
             error_code,
             frame.instruction_pointer.as_u64()
         );
+        crate::ipc::process_died(crate::sched::current_id(), crate::ipc::DeathReason::Fault);
         crate::sched::exit_current();
     }
     panic!(
@@ -590,6 +619,26 @@ extern "x86-interrupt" fn timer_handler(_frame: InterruptStackFrame) {
 extern "x86-interrupt" fn resched_handler(_frame: InterruptStackFrame) {
     lapic_eoi();
     crate::sched::schedule();
+}
+
+/// TLB shootdown IPI: reload CR3 when the caller unmapped pages in the
+/// address space this CPU is currently running.
+extern "x86-interrupt" fn tlb_handler(_frame: InterruptStackFrame) {
+    let cpu = smp::cpu_index();
+    if cpu < smp::MAX_CPUS {
+        let target = TLB_MAILBOX[cpu].swap(0, Ordering::AcqRel);
+        if target != 0 {
+            let (frame, _) = Cr3::read();
+            if frame.start_address().as_u64() == target {
+                // WHY unsafe: reloading the current CR3 is privileged and
+                // flushes every non-global TLB entry for this process.
+                unsafe {
+                    Cr3::write(frame, Cr3Flags::empty());
+                }
+            }
+        }
+    }
+    lapic_eoi();
 }
 
 // --- Userspace driver IRQs --------------------------------------------------
@@ -670,11 +719,13 @@ global_asm!(
     // at the callee entry point.
     "    sub rsp, 8",
     //
-    // Подготовка аргументов для syscall_dispatch(num, a1, a2, a3)
+    // Подготовка аргументов для syscall_dispatch(num, a1, a2, a3, a4, a5)
     "    mov rcx, rdx", // a3 -> rcx
     "    mov rdx, rsi", // a2 -> rdx
     "    mov rsi, rdi", // a1 -> rsi
     "    mov rdi, rax", // num -> rdi
+    "    mov r9, r8",   // user r8  -> a5
+    "    mov r8, r10",  // user r10 -> a4
     "    call syscall_dispatch",
     //
     "    add rsp, 8",

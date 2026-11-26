@@ -9,6 +9,9 @@ use novax_memory::{
     FRAME_SIZE, NO_EXEC, PRESENT, USER, WRITABLE,
 };
 
+use crate::cdt;
+use crate::ipc::{CapKind, Capability, CAP_READ, CAP_WRITE, NO_NODE};
+use crate::shm::{MAX_SHM_LEN, SHM_VIRT_BASE};
 use crate::{dma::DMA_VIRT_BASE, memory_mut, mmio::MMIO_VIRT_BASE, sched, serial_println};
 
 /// Top of the user stack. Must be in the lower half and page-aligned
@@ -53,6 +56,13 @@ pub enum UserError {
     Memory(#[allow(dead_code)] MemoryError),
     /// ELF has no entry point inside a mapped segment.
     NoEntry,
+    /// Unknown program id passed to `SYS_SPAWN`.
+    BadProgram,
+    /// A `CapGrant` references a missing capability or asks for rights the
+    /// caller does not hold.
+    BadGrant,
+    /// More grants than the fixed cspace prefix can hold.
+    TooManyGrants,
 }
 
 impl From<MemoryError> for UserError {
@@ -191,6 +201,7 @@ pub fn load_elf(space: &AddressSpace, elf: &[u8]) -> Result<u64, UserError> {
             }
             if overlaps(start, end, DMA_VIRT_BASE, DMA_VIRT_BASE + DMA_MAX_LEN)
                 || overlaps(start, end, MMIO_VIRT_BASE, MMIO_VIRT_BASE + MMIO_MAX_LEN)
+                || overlaps(start, end, SHM_VIRT_BASE, SHM_VIRT_BASE + MAX_SHM_LEN)
             {
                 return Err(UserError::Malformed);
             }
@@ -324,6 +335,139 @@ pub fn launch(
         space.pml4_phys()
     );
     Ok(tid)
+}
+
+/// One capability handed to a child by `SYS_SPAWN`.
+#[derive(Clone, Copy, Debug)]
+pub struct CapGrant {
+    /// Slot in the caller's cspace to derive from.
+    pub src_slot: u32,
+    /// Requested rights (must be a subset of the source capability).
+    pub rights: u32,
+}
+
+/// Programs that ring 3 may spawn by id.
+pub const PROG_V02_SERVER: u64 = 1;
+pub const PROG_V02_CLIENT: u64 = 2;
+
+fn program_elf(id: u64) -> Option<&'static [u8]> {
+    match id {
+        PROG_V02_SERVER => Some(include_bytes!(concat!(env!("OUT_DIR"), "/v02_server.elf"))),
+        PROG_V02_CLIENT => Some(include_bytes!(concat!(env!("OUT_DIR"), "/v02_client.elf"))),
+        _ => None,
+    }
+}
+
+/// Load an embedded program into a fresh address space, populate its cspace
+/// from `grants`, install a `Process` capability in the caller's cspace and
+/// only then make the child runnable.
+pub fn spawn_program(prog_id: u64, grants: &[CapGrant]) -> Result<u8, UserError> {
+    if grants.len() > 8 {
+        return Err(UserError::TooManyGrants);
+    }
+    let elf = program_elf(prog_id).ok_or(UserError::BadProgram)?;
+
+    // Validate and pin every parent capability before touching memory.
+    let mut sources = [(
+        Capability {
+            kind: CapKind::Endpoint(0),
+            rights: 0,
+            node: NO_NODE,
+        },
+        NO_NODE,
+    ); 8];
+    for (i, grant) in grants.iter().enumerate() {
+        let cap = sched::get_current_cap(grant.src_slot as u64).ok_or(UserError::BadGrant)?;
+        let rights = cap.rights & grant.rights;
+        if rights == 0 {
+            return Err(UserError::BadGrant);
+        }
+        let parent =
+            cdt::ensure_current_cap_node(grant.src_slot as u64, cap).ok_or(UserError::BadGrant)?;
+        sources[i] = (
+            Capability {
+                kind: cap.kind,
+                rights,
+                node: NO_NODE,
+            },
+            parent,
+        );
+    }
+
+    let space = AddressSpace::new()?;
+    let entry = match load_elf(&space, elf) {
+        Ok(entry) => entry,
+        Err(e) => {
+            space.destroy();
+            return Err(e);
+        }
+    };
+
+    let mut cspace = [None; 16];
+    for (i, (cap, _)) in sources.iter().take(grants.len()).enumerate() {
+        cspace[i] = Some(*cap);
+    }
+    let tid = sched::spawn_user_blocked(
+        "spawned",
+        space.pml4_phys(),
+        entry,
+        USER_STACK_TOP - 16,
+        cspace,
+    );
+
+    for (i, (cap, parent)) in sources.iter().take(grants.len()).enumerate() {
+        let Some(node) = cdt::alloc_child(*parent, tid, i as u8, cap.kind, cap.rights) else {
+            cdt::revoke_owned(tid);
+            sched::kill_thread(tid);
+            space.destroy();
+            return Err(UserError::BadGrant);
+        };
+        let mut installed = *cap;
+        installed.node = node;
+        if !sched::set_thread_cap(tid, i as u8, installed) {
+            cdt::revoke_owned(tid);
+            sched::kill_thread(tid);
+            space.destroy();
+            return Err(UserError::BadGrant);
+        }
+    }
+
+    let Some(slot) = sched::first_free_cap_slot() else {
+        cdt::revoke_owned(tid);
+        sched::kill_thread(tid);
+        space.destroy();
+        return Err(UserError::BadGrant);
+    };
+    let owner = sched::current_id();
+    let Some(node) = cdt::alloc_root(owner, slot, CapKind::Process(tid), CAP_READ | CAP_WRITE)
+    else {
+        cdt::revoke_owned(tid);
+        sched::kill_thread(tid);
+        space.destroy();
+        return Err(UserError::BadGrant);
+    };
+    let process_cap = Capability {
+        kind: CapKind::Process(tid),
+        rights: CAP_READ | CAP_WRITE,
+        node,
+    };
+    if !sched::install_current_cap_at(slot, process_cap) {
+        cdt::free_node(node);
+        cdt::revoke_owned(tid);
+        sched::kill_thread(tid);
+        space.destroy();
+        return Err(UserError::BadGrant);
+    }
+
+    sched::wake_thread(tid);
+    serial_println!(
+        "spawn: program {} -> thread {} pml4={:#x} proc_slot={}",
+        prog_id,
+        tid,
+        space.pml4_phys(),
+        slot
+    );
+    Ok(slot)
 }
 
 /// Trampoline: entered via `switch_context` on the first run of a

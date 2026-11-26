@@ -6,6 +6,7 @@
 
 use novax_memory::{PageTableRef, FRAME_SIZE, NO_EXEC, PCD, PRESENT, PWT, USER, WRITABLE};
 
+use crate::sched::ThreadId;
 use crate::{memory_mut, sched, serial_println};
 
 /// Fixed user virtual address for MMIO windows. Sits between the program
@@ -90,4 +91,23 @@ pub fn map_for_current(paddr: u64, len: u64, out_ptr: u64) -> Result<(), MmioErr
         pages
     );
     Ok(())
+}
+
+/// Unmap the window described by a revoked `Mmio` capability from the
+/// address space of `owner`.
+pub fn unmap_for(owner: ThreadId, pml4: u64, paddr: u64, len: u64) {
+    if pml4 == 0 || len == 0 {
+        return;
+    }
+    let offset = paddr & (FRAME_SIZE - 1);
+    let pages = len.saturating_add(offset).div_ceil(FRAME_SIZE);
+    memory_mut(|m| {
+        let hhdm = m.frames.hhdm();
+        let mut paging = PageTableRef::from_phys(pml4, hhdm);
+        for i in 0..pages {
+            let _ = paging.unmap(MMIO_VIRT_BASE + i * FRAME_SIZE, &mut m.frames);
+        }
+    });
+    crate::arch::x86_64::flush_tlb_remote(owner, pml4);
+    serial_println!("mmio: revoked {} page(s) of thread {}", pages, owner);
 }

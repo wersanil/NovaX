@@ -1,4 +1,4 @@
-# NovaX — Architecture & Project Summary (v0.1.2, Milestones 0–10)
+# NovaX — Architecture & Project Summary (v0.2.0, Milestones 0–11)
 
 Microkernel OS for x86_64. `Heart` keeps only what cannot live in userspace:
 memory, scheduling, IPC, syscalls, IRQ routing. Drivers and services are
@@ -21,6 +21,8 @@ kernel/heart/                  microkernel binary (no_std)
   src/heap.rs                  1 MiB heap @ 0xffff_ffff_9000_0000
   src/sched.rs                 TCB, per-CPU queues, affinity, switching
   src/ipc.rs                   endpoints, messages, caps, IRQ routes
+  src/cdt.rs                   capability derivation tree (mint/revoke)
+  src/shm.rs                   read-only shared-buffer mappings
   src/syscall.rs               dispatch + user-memory copy helpers
   src/user.rs                  ELF64 loader, address spaces, ring-3 entry
   src/dma.rs                   contiguous DMA window for drivers
@@ -40,6 +42,8 @@ userspace/                     single-file programs, one linker.ld each
   shell/                       line editor, forwards commands to init
   fb/                          ring-3 framebuffer text console
   net/                         virtio-net server (ARP + ICMP)
+  supervisor/                  v0.2 capability-lifecycle supervisor
+  v02_server/ v02_client/      v0.2 crash/revoke/respawn stand
 tools/                         fetch_limine, mkiso, qemu_run, qemu_gui,
                                test, m6/m7/m8/m9 test + check, git_commit
 ```
@@ -99,13 +103,14 @@ discovery; APs start after all userspace threads are spawned.
   read it. AP boot: Limine `MpRequest` → `bootstrap(ap_entry, slot)`; the
   naked entry loads its stack, installs per-CPU GDT/TSS/IDT, enables the
   LAPIC, creates an idle thread and joins the scheduler. Max 8 CPUs.
-- Vectors: timer `0x20`, reschedule IPI `0x30`, IRQ1 `0x21`, IRQ4 `0x24`.
+- Vectors: timer `0x20`, reschedule IPI `0x30`, TLB shootdown IPI `0x31`,
+  IRQ1 `0x21`, IRQ4 `0x24`.
   IOAPIC ISA lines are edge/active-high, destination = BSP LAPIC id.
 ### Syscall ABI
 
 `syscall`/`sysretq`; `EFER.SCE=1`, `STAR` = kernel CS 0x08 / user CS 0x23,
 `LSTAR=syscall_entry`, `FMASK=0x700` (clears IF, TF, DF).
-- Input: `rax` = number, `rdi`, `rsi`, `rdx` = arguments.
+- Input: `rax` = number, `rdi`, `rsi`, `rdx`, `r10`, `r8` = arguments.
 - Output: `rax`; `rcx`/`r11` are clobbered by the instruction itself.
 - Other GPRs preserved; per-CPU `kernel_rsp`/`user_rsp` via `gs:`.
 - Every user pointer is walked page by page against the current PML4
@@ -126,6 +131,18 @@ discovery; APs start after all userspace threads are spawned.
 | 9 | DMA_ALLOC | dma_cap, out_ptr | 0 |
 | 10–13 | INW/OUTW/INL/OUTL | io_cap, offset[, value] | word/dword / 0 |
 | 14 | MAP_MMIO | mmio_cap, out_ptr | 0; writes `{virt, paddr, len}` |
+| 15 | CAP_MINT | cap, new_rights, out_slot | 0; writes `u64` slot |
+| 16 | CAP_REVOKE | cap | 0; root stays, descendants die |
+| 17 | SEND_CAP | ep_cap, ptr, len | payload len; header carries one cap |
+| 18 | RECV_CAP | ep_cap, ptr, max, out_meta | len; `{cap_slot, reply_slot}` |
+| 19 | CALL | ep, req, req_len, reply, reply_max | reply len |
+| 20 | REPLY | reply_cap, ptr, len | 0; one-shot, slot burns |
+| 21 | NOTIFY_SIGNAL | notify_cap, badge | 0 |
+| 22 | NOTIFY_WAIT | notify_cap | consumed mask |
+| 23 | NOTIFY_POLL | notify_cap | mask (`swap(0)`) |
+| 24 | NOTIFY_BIND | notify, source, src_cap, badge | 0 |
+| 25 | SPAWN | prog_id, grants, grants_len, out_meta | 0; `{proc_slot}` |
+| 26 | MAP_SHARED | shm_cap, out_info | 0; writes `{virt, phys, len}` |
 Errors return `u64::MAX`; kernel internals use `Result<T, E>`.
 ### IPC and capabilities
 
@@ -145,6 +162,40 @@ Errors return `u64::MAX`; kernel internals use `Result<T, E>`.
   caps an endpoint queue at 1024 messages and drops on overflow. The
   serial console therefore never waits for a stalled fb server.
 
+### Capability lifecycle and notifications (v0.2)
+
+- `Capability = { kind, rights, node }`; `node` indexes the static CDT
+  (`cdt.rs`, 256 nodes, no heap). Nodes form a parent + doubly-linked
+  child list. Kinds add `Notification(id)`, `Reply(id)`, `Process(tid)`,
+  `DmaMapped { phys, len }` and `Shm { phys, len }`.
+- `SYS_CAP_MINT` derives a child in the first free cspace slot with
+  `new_rights ⊆ old_rights`; widening is rejected. Minting an allocated
+  `DmaMapped` yields a read-only `Shm`.
+- `SYS_CAP_REVOKE` destroys every descendant of the root node, clears the
+  owners' cspace slots and unmaps MMIO (`0x4000_0000`), DMA
+  (`0x3000_0000`, frames freed) and shared (`0x5000_0000`) windows. A
+  targeted TLB shootdown IPI (vector `0x31`) reloads CR3 on the owner CPU.
+- Process death (`SYS_EXIT` or a ring-3 fault) runs `ipc::process_died`:
+  signal bound notifications, fail pending calls, revoke every capability
+  owned by the thread and release its DMA window. `SYS_CAP_REVOKE` is
+  idempotent and still removes descendants held by live processes.
+- Capability transfer uses a 12-byte `IpcHeader` (`NVCH`, `cap_slot`,
+  `cap_rights`) at the start of a `SEND_CAP`/`CALL` payload; the kernel
+  strips it and creates the CDT child only when `RECV_CAP` installs it.
+- `SYS_CALL` allocates a one-shot `Reply` capability and installs it in
+  the server's cspace when the message is received; `SYS_REPLY` copies
+  the answer into the blocked client's address space (translated through
+  its PML4), burns the slot and wakes the client.
+- `Notification` is an `AtomicU64` mask plus an 8-entry wait queue.
+  `SIGNAL` does `fetch_or(badge)` and wakes waiters; `WAIT` consumes with
+  `swap(0)` and blocks; `POLL` is the non-blocking `swap(0)` for ring-3
+  event loops. `NOTIFY_BIND` attaches an IRQ line or a child process
+  exit/fault to a notification with a badge.
+- `SYS_SPAWN` loads an embedded program by id (`1 = v02_server`,
+  `2 = v02_client`) into a fresh PML4, derives its cspace from
+  `CapGrant[]`, returns a `Process` capability and only then makes the
+  thread runnable.
+
 ## 3. Userspace servers
 
 | Program | Caps | Role |
@@ -157,6 +208,9 @@ Errors return `u64::MAX`; kernel internals use `Result<T, E>`.
 | `shell` | init_ep W, shell_in R, reply_ep R | line buffer + printing |
 | `fb` | Mmio, fb_info R, fb_console R | 8x16 text console on the framebuffer |
 | `net` | IoPort(BAR0), Dma(64 KiB) | virtio-net, ARP, ICMP |
+| `supervisor` | ep R/W, notification, Dma, go/done ep | v0.2 mint/revoke/notify stand |
+| `v02_server` | ep READ | call + shared map + deliberate fault |
+| `v02_client` | ep WRITE, Dma, Shm, go READ, done WRITE | two calls around respawn |
 Path: keyboard/COM1 → `serial` → `shell_in_ep` → `shell` → `init_ep` →
 `init` → `reply_ep` → `shell` → console via `SYS_WRITE` (COM1 and,
 when present, the fb console).
@@ -172,7 +226,7 @@ The kernel requests a Limine framebuffer and grants the `fb` server:
 `fb` calls `SYS_MAP_MMIO`, receives `{virt, paddr, len}`, then renders a
 text console with an embedded 8x16 ASCII font. The style is NovaX
 cybercore: `#0A0A0C` background, a red `#E60000` banner
-`NOVAX v0.1.2 // HEART MICROKERNEL`, and `#E5E5E5` text. The banner and a
+`NOVAX v0.2.0 // HEART MICROKERNEL`, and `#E5E5E5` text. The banner and a
 separator stay pinned to the top; the log area below scrolls when full.
 Supported formats are 32/24/16 bpp with RGB masks from `FbInfo`; any
 other format makes `fb` log an error and exit instead of panicking.
@@ -234,6 +288,7 @@ Checks (each boots QEMU and inspects the serial stream):
 ./tools/m7_test.sh   # shell -> init -> shell, echo hello
 ./tools/m8_test.sh   # 2 CPUs, workers on cpu0/cpu1 + M5–M7
 ./tools/m9_test.sh   # virtio-net ARP + ICMP + M5–M8
+./tools/v02_test.sh  # v0.2 mint/revoke, reply-cap, notification, respawn
 ./tools/test.sh      # kernel self-tests, success = QEMU exit 33
 ```
 
@@ -280,7 +335,21 @@ net: ping 10.0.2.2 ok
 - Huge-page entries are rejected during map/unmap; port-I/O width and
   DMA/MMIO result pointers are validated.
 
-## 5. Limitations (v0.1.2)
+### Capability lifecycle (v0.2.0)
+
+- Static CDT with transitive `SYS_CAP_REVOKE`; revoked MMIO, DMA and
+  shared windows are unmapped, DMA frames freed, and the owner CPU gets a
+  targeted TLB shootdown IPI.
+- IPC messages can carry exactly one capability (`SEND_CAP`/`RECV_CAP`);
+  `SYS_CALL`/`SYS_REPLY` provide one-shot reply capabilities without
+  exposing thread ids.
+- `Notification` objects with `AtomicU64` badges, blocking wait,
+  non-blocking poll, and IRQ/process-exit/fault bindings.
+- `SYS_SPAWN` with an embedded-program registry and `CapGrant[]`; the
+  `supervisor` stand exercises mint → transfer → fault → revoke → respawn
+  end to end in `tools/v02_test.sh`.
+
+## 5. Limitations (v0.2.0)
 
 - **One linear framebuffer**: no multi-monitor, no mode setting, no
   double buffering; `fb` writes directly to the MMIO window.
@@ -296,13 +365,16 @@ net: ping 10.0.2.2 ok
   UDP/TCP, checksum offload or scatter-gather.
 - **Scheduler**: static affinity, no load balancing or priorities; the
   busy-spin SMP workers exist only as proof of parallel scheduling.
-- **No TLB shootdown**; safe only because each process runs on one CPU.
-- **No process model**: no fork/exec, file descriptors or `wait`; no
-  VFS/ramfs, no devmgr, no ACPI; PCI is root bus + legacy config only.
+- **No TLB shootdown broadcast**: v0.2 adds a targeted IPI for the owner
+  CPU; address spaces are still pinned to one CPU.
+- **Minimal process model**: `SYS_SPAWN` loads embedded programs by id;
+  no fork/exec, file descriptors or `wait`. No VFS/ramfs, devmgr or ACPI;
+  PCI is root bus + legacy config only.
 - **No SMAP/SMEP**, no global W^X; user copies validate page mapping and
   rights, but the hardware still permits a ring-0 access to a user page.
 - **Fixed limits**: 16 caps/thread, 64-byte messages, 8 CPUs, one DMA
-  window, one 256 MiB MMIO window.
+  window, one 256 MiB MMIO window, 256 CDT nodes, 32 notifications,
+  16 in-flight replies, one shared window per process.
 - **No `libnovax`**: `userspace/common/abi.rs` removes the duplicated
   syscall stubs, but there is no reusable userspace library crate yet;
   logging is direct `SYS_WRITE`, not a serial-server protocol.

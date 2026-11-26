@@ -48,6 +48,9 @@ pub struct Tcb {
     pub id: ThreadId,
     /// Current lifecycle state.
     pub state: State,
+    /// Set as soon as the process is known to be dying; `state` follows
+    /// after the capability cleanup has finished.
+    pub died: bool,
     /// Saved kernel stack pointer used by `switch_context`.
     pub rsp: u64,
     _stack: Option<Box<Stack>>,
@@ -114,6 +117,7 @@ pub fn init() {
         let slot = s.push(Tcb {
             id: 0,
             state: State::Running,
+            died: false,
             rsp: 0,
             _stack: None,
             name: "main",
@@ -149,6 +153,7 @@ pub fn init_cpu_idle(cpu: usize) -> ThreadId {
     let slot = s.push(Tcb {
         id,
         state: State::Running,
+        died: false,
         rsp: 0,
         _stack: None,
         name: "cpu-idle",
@@ -208,6 +213,7 @@ pub fn spawn_on(name: &'static str, entry: EntryFn, cpu: usize) -> ThreadId {
         s.push(Tcb {
             id,
             state: State::Ready,
+            died: false,
             rsp: initial_rsp,
             _stack: Some(stack),
             name,
@@ -232,6 +238,30 @@ pub fn spawn_user(
     entry: u64,
     user_stack: u64,
     cspace: [Option<Capability>; 16],
+) -> ThreadId {
+    spawn_user_inner(name, pml4_phys, entry, user_stack, cspace, State::Ready)
+}
+
+/// Spawn a user thread that starts blocked. `SYS_SPAWN` uses this so the
+/// capability space can be populated before another CPU can run the new
+/// process; the caller then calls [`wake_thread`].
+pub fn spawn_user_blocked(
+    name: &'static str,
+    pml4_phys: u64,
+    entry: u64,
+    user_stack: u64,
+    cspace: [Option<Capability>; 16],
+) -> ThreadId {
+    spawn_user_inner(name, pml4_phys, entry, user_stack, cspace, State::Blocked)
+}
+
+fn spawn_user_inner(
+    name: &'static str,
+    pml4_phys: u64,
+    entry: u64,
+    user_stack: u64,
+    cspace: [Option<Capability>; 16],
+    initial_state: State,
 ) -> ThreadId {
     interrupts::without_interrupts(|| {
         let mut s = SCHEDULER.get().expect("sched: call init first").lock();
@@ -264,7 +294,8 @@ pub fn spawn_user(
 
         s.push(Tcb {
             id,
-            state: State::Ready,
+            state: initial_state,
+            died: false,
             rsp: initial_rsp,
             _stack: Some(stack),
             name,
@@ -477,6 +508,142 @@ pub fn get_current_cap(idx: u64) -> Option<Capability> {
         .current
         .load(core::sync::atomic::Ordering::Acquire) as usize;
     s.threads[cur].cspace.get(idx as usize).copied().flatten()
+}
+
+/// Physical PML4 of `tid` (0 for kernel threads / unknown ids).
+pub fn pml4_of(tid: ThreadId) -> Option<u64> {
+    let s = SCHEDULER.get().expect("sched").lock();
+    s.threads.iter().find(|t| t.id == tid).map(|t| t.pml4_phys)
+}
+
+/// Home CPU of `tid`.
+pub fn cpu_of(tid: ThreadId) -> Option<usize> {
+    let s = SCHEDULER.get().expect("sched").lock();
+    s.threads.iter().find(|t| t.id == tid).map(|t| t.cpu)
+}
+
+/// Mark `tid` as dying before its capabilities are revoked.
+pub fn mark_died(tid: ThreadId) {
+    let mut s = SCHEDULER.get().expect("sched").lock();
+    if let Some(t) = s.threads.iter_mut().find(|t| t.id == tid) {
+        t.died = true;
+    }
+}
+
+/// True once `process_died` has started for `tid`.
+pub fn is_dead(tid: ThreadId) -> bool {
+    let s = SCHEDULER.get().expect("sched").lock();
+    s.threads
+        .iter()
+        .find(|t| t.id == tid)
+        .map(|t| t.died)
+        .unwrap_or(true)
+}
+
+/// Clear `slot` of `tid` only if it still holds CDT node `node`.
+pub fn clear_cap_if(tid: ThreadId, slot: u8, node: u16) {
+    let mut s = SCHEDULER.get().expect("sched").lock();
+    let Some(t) = s.threads.iter_mut().find(|t| t.id == tid) else {
+        return;
+    };
+    if let Some(Some(cap)) = t.cspace.get(slot as usize) {
+        if cap.node == node {
+            t.cspace[slot as usize] = None;
+        }
+    }
+}
+
+/// Clear one slot of the current thread.
+pub fn clear_current_cap(slot: u64) {
+    let mut s = SCHEDULER.get().expect("sched").lock();
+    let cur = smp::current()
+        .current
+        .load(core::sync::atomic::Ordering::Acquire) as usize;
+    if let Some(entry) = s.threads[cur].cspace.get_mut(slot as usize) {
+        *entry = None;
+    }
+}
+
+/// Store the CDT node id of a current-thread capability.
+pub fn set_current_cap_node(slot: u64, node: u16) -> bool {
+    let mut s = SCHEDULER.get().expect("sched").lock();
+    let cur = smp::current()
+        .current
+        .load(core::sync::atomic::Ordering::Acquire) as usize;
+    match s.threads[cur].cspace.get_mut(slot as usize) {
+        Some(Some(cap)) => {
+            cap.node = node;
+            true
+        }
+        _ => false,
+    }
+}
+
+/// Replace the kind of a current-thread capability (`Dma` → `DmaMapped`).
+pub fn set_current_cap_kind(slot: u64, kind: crate::ipc::CapKind) -> bool {
+    let mut s = SCHEDULER.get().expect("sched").lock();
+    let cur = smp::current()
+        .current
+        .load(core::sync::atomic::Ordering::Acquire) as usize;
+    match s.threads[cur].cspace.get_mut(slot as usize) {
+        Some(Some(cap)) => {
+            cap.kind = kind;
+            true
+        }
+        _ => false,
+    }
+}
+
+/// First empty slot in the current cspace.
+pub fn first_free_cap_slot() -> Option<u8> {
+    let s = SCHEDULER.get().expect("sched").lock();
+    let cur = smp::current()
+        .current
+        .load(core::sync::atomic::Ordering::Acquire) as usize;
+    s.threads[cur]
+        .cspace
+        .iter()
+        .position(|c| c.is_none())
+        .map(|i| i as u8)
+}
+
+/// Install a capability in a specific free slot of the current thread.
+pub fn install_current_cap_at(slot: u8, cap: Capability) -> bool {
+    let mut s = SCHEDULER.get().expect("sched").lock();
+    let cur = smp::current()
+        .current
+        .load(core::sync::atomic::Ordering::Acquire) as usize;
+    match s.threads[cur].cspace.get_mut(slot as usize) {
+        Some(entry) if entry.is_none() => {
+            *entry = Some(cap);
+            true
+        }
+        _ => false,
+    }
+}
+
+/// Replace one capability of an arbitrary thread.
+pub fn set_thread_cap(tid: ThreadId, slot: u8, cap: Capability) -> bool {
+    let mut s = SCHEDULER.get().expect("sched").lock();
+    match s.threads.iter_mut().find(|t| t.id == tid) {
+        Some(t) => match t.cspace.get_mut(slot as usize) {
+            Some(entry) => {
+                *entry = Some(cap);
+                true
+            }
+            None => false,
+        },
+        None => false,
+    }
+}
+
+/// Mark a blocked thread dead (used when `SYS_SPAWN` fails halfway).
+pub fn kill_thread(tid: ThreadId) {
+    let mut s = SCHEDULER.get().expect("sched").lock();
+    if let Some(t) = s.threads.iter_mut().find(|t| t.id == tid) {
+        t.died = true;
+        t.state = State::Dead;
+    }
 }
 
 fn pick_next(s: &Scheduler, from: usize, cpu: usize) -> usize {

@@ -31,7 +31,17 @@ fn main() {
     println!("cargo:rerun-if-changed={}", abi.display());
 
     let user_progs = [
-        "client", "server", "serial", "kbd", "init", "shell", "net", "fb",
+        "client",
+        "server",
+        "serial",
+        "kbd",
+        "init",
+        "shell",
+        "net",
+        "fb",
+        "supervisor",
+        "v02_server",
+        "v02_client",
     ];
     for prog in user_progs {
         let user_dir = root.join(format!("userspace/{prog}"));

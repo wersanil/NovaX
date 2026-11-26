@@ -16,7 +16,7 @@
   <a href="https://github.com"><img alt="FreeMind Soft" src="https://img.shields.io/badge/FreeMind_Soft-project-39ff14?style=flat-square&labelColor=0b0f14"></a>
 </p>
 
-<p align="center"><sub>v0.1.2 · Ring-3 Framebuffer & Capability Microkernel · <a href="docs/ARCHITECTURE.md">Architecture</a></sub></p>
+<p align="center"><sub>v0.2.0 · Capability Lifecycle & Async Notifications · <a href="docs/ARCHITECTURE.md">Architecture</a></sub></p>
 
 ---
 
@@ -37,11 +37,11 @@ The result is a small multicore microkernel that is easy to audit and hard to ac
 +----------------------------------------------------------------+
 | RING 3 - SERVERS                                               |
 |                                                                |
-|   serial      kbd       init       shell       net             |
-|   COM1/IRQ4   IRQ1      commands   line        ARP / ICMP      |
-|      \         |          |          |          /              |
-|       +--------+----------+----------+---------+               |
-|                    capability-checked IPC                      |
+|   serial      kbd       init       shell       net     supervisor|
+|   COM1/IRQ4   IRQ1      commands   line        ARP/ICMP  mint/revoke |
+|      \         |          |          |          /              |   |
+|       +--------+----------+----------+---------+---------------+   |
+|                    capability-checked IPC + notifications          |
 +------------------------------|---------------------------------+
                                | syscall / message
 +------------------------------|---------------------------------+
@@ -60,15 +60,24 @@ IRQ routing. Everything else is a ring-3 server.
 ### Capability space
 
 ```
-cspace[16] = { kind, rights }
+cspace[16] = { kind, rights, cdt_node }
 
-  Endpoint(id)      message queue
-  Irq(n)            legacy ISA line
-  IoPort(base,len)  bounded port window
-  Dma(len)          bounded DMA window
+  Endpoint(id)       message queue
+  Irq(n)             legacy ISA line
+  IoPort(base,len)   bounded port window
+  Dma(len)           bounded DMA window
+  Mmio(paddr,len)    physical MMIO window
+  Notification(id)   async event mask
+  Reply(id)          one-shot call reply
+  Process(tid)       child handle (tid stays kernel-private)
+  Shm(phys,len)      read-only shared buffer
 
   CAP_READ | CAP_WRITE | CAP_NOTIFY
 ```
+
+Every derived capability has a node in a static derivation tree, so
+`SYS_CAP_REVOKE` can transitively revoke children and unmap their MMIO,
+DMA and shared windows.
 
 A capability is the only way to reach a kernel object. There is no root
 capability, no inheritance by name and no global port table.
@@ -122,6 +131,7 @@ network backed by a legacy virtio-net device.
 | `./tools/m7_test.sh` | `shell -> init -> shell`, `echo hello` |
 | `./tools/m8_test.sh` | 2 CPUs, workers on cpu0/cpu1, M5–M7 regressions |
 | `./tools/m9_test.sh` | virtio-net ARP + ICMP ping, M5–M8 regressions |
+| `./tools/v02_test.sh` | v0.2 mint/revoke, reply-cap, notification, respawn |
 
 ```bash
 ./tools/test.sh
@@ -129,6 +139,7 @@ network backed by a legacy virtio-net device.
 ./tools/m7_test.sh
 ./tools/m8_test.sh
 ./tools/m9_test.sh
+./tools/v02_test.sh
 ```
 
 ## // 03 — REFERENCE BOOT LOG
@@ -174,41 +185,39 @@ docs/              architecture notes and assets
 
 Deep dive: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
-## // 05 — WHAT'S NEW IN v0.1.2
+## // 05 — WHAT'S NEW IN v0.2.0
 
-v0.1.2 is a security and correctness release. No ABI changes; all
-existing ring-3 servers keep working.
+v0.2.0 is the capability-lifecycle and asynchronous-notification release.
+The old M5–M9 ABI is unchanged; the new calls continue at syscall 15.
 
-- **Hardened ELF loader** — program headers, file ranges and virtual
-  ranges are validated before a single frame is allocated; segments must
-  stay in the user half and outside the stack/DMA/MMIO windows; a failed
-  load frees every frame and page table it created.
-- **Checked user pointers** — `SYS_WRITE/SEND/RECV/DMA_ALLOC/MAP_MMIO`
-  walk the current PML4 and require `USER` (and `WRITABLE` for output)
-  before touching a pointer. Bad pointers return an error instead of
-  faulting in ring 0.
-- **Ring-3 fault isolation** — `#PF/#GP/#UD/#DE/#SS/#AC` from ring 3
-  terminate the faulty thread; the kernel no longer panics on a driver
-  bug.
-- **Bounded IPC** — endpoint FIFOs are capped at 1024 messages, and a
-  second blocked receiver gets an explicit error instead of overwriting
-  the first one.
-- **SMP hardening** — new threads start with interrupts disabled, AP idle
-  uses `cli; schedule; sti; hlt`, and the IOAPIC is programmed with the
-  real BSP LAPIC id.
-- **Paging/IO guards** — huge-page entries are rejected during map/unmap,
-  port-I/O accesses are checked against the full capability window, and
-  DMA/MMIO validate the result pointer before mapping.
+- **CDT + transitive revoke** — a fixed 256-node capability derivation
+  tree with `SYS_CAP_MINT` (rights can only shrink) and
+  `SYS_CAP_REVOKE`, which clears descendants and unmaps MMIO, DMA and
+  shared windows (with a targeted TLB shootdown IPI on vector `0x31`).
+- **Capability transfer over IPC** — `SEND_CAP`/`RECV_CAP` carry exactly
+  one capability in a 12-byte `IpcHeader`; the child node is created only
+  when the receiver installs it.
+- **One-shot reply capabilities** — `SYS_CALL`/`SYS_REPLY` give the
+  server a burn-after-use reply slot; the client's thread id is never
+  exposed.
+- **Notifications** — `Notification` objects with an `AtomicU64` badge
+  mask, `SIGNAL`/`WAIT`/`POLL`, and IRQ or child-process exit/fault
+  bindings.
+- **`SYS_SPAWN`** — embedded-program registry plus `CapGrant[]`, used by
+  the new `supervisor` stand: mint → call → deliberate fault → notify →
+  revoke → respawn → second call, all in `tools/v02_test.sh`.
+- **Process-death cleanup** — exit or a ring-3 fault notifies supervisors,
+  fails pending calls, revokes owned capabilities and releases DMA.
 
 ## // 06 — STATUS
 
-v0.1.2 is a working research kernel, not a general-purpose OS.
+v0.2.0 is a working research kernel, not a general-purpose OS.
 
 - Graphics runs over the boot-time GOP/VBE linear framebuffer via userspace/fb (no runtime modesetting or 2D/3D hardware acceleration yet).
 - Legacy virtio only; the net driver polls the used ring (no MSI-X).
 - Networking is ARP + ICMP only; no DHCP, UDP or TCP.
-- No process model (fork/exec/wait), no VFS, no ACPI, no SMAP/SMEP.
-- Fixed limits: 16 caps per thread, 64-byte messages, 1024-message queues, 8 CPUs, one DMA window.
+- Minimal process model: `SYS_SPAWN` with embedded programs; no fork/exec/wait, no VFS, no ACPI, no SMAP/SMEP.
+- Fixed limits: 16 caps per thread, 64-byte messages, 1024-message queues, 8 CPUs, one DMA window, 256 CDT nodes.
 
 These are deliberate scope choices for an auditable core, not hidden
 shortcuts. The full list lives in the architecture document.
@@ -227,4 +236,4 @@ See [LICENSE](LICENSE).
 
 ---
 
-<p align="center"><sub>NovaX v0.1.2 · FreeMind Soft · small kernel, explicit authority</sub></p>
+<p align="center"><sub>NovaX v0.2.0 · FreeMind Soft · small kernel, explicit authority</sub></p>

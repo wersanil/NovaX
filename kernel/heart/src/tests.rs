@@ -5,6 +5,7 @@
 
 use novax_memory::{MemoryError, NO_EXEC, PRESENT, USER, WRITABLE};
 
+use crate::cdt;
 use crate::ipc::{self, Message, RecvOutcome};
 use crate::user::{self, AddressSpace};
 use crate::{arch, memory_mut, sched, serial_println};
@@ -19,6 +20,8 @@ pub fn run_all() {
     test_user_range_check();
     test_heap_alloc();
     test_ipc_queue_bound();
+    test_cdt_mint_revoke();
+    test_notification_bits();
     test_elf_loader();
     test_breakpoint();
     test_timer_ticks();
@@ -213,11 +216,7 @@ fn test_user_range_check() {
 fn test_ipc_queue_bound() {
     serial_println!("[test] ipc queue is bounded and recoverable");
     let ep = ipc::create_endpoint();
-    let msg = Message {
-        data: [0u8; ipc::MAX_MSG_LEN],
-        len: 0,
-        sender: 0,
-    };
+    let msg = Message::plain([0u8; ipc::MAX_MSG_LEN], 0, 0);
 
     for i in 0..ipc::MAX_QUEUE {
         assert!(ipc::send(ep, msg), "queue must accept message {i}");
@@ -236,6 +235,40 @@ fn test_ipc_queue_bound() {
     assert!(ipc::send(ep, msg), "queue must accept after draining");
     assert!(matches!(ipc::recv(ep), RecvOutcome::Message(_)));
 
+    serial_println!("    ok");
+}
+
+fn test_cdt_mint_revoke() {
+    serial_println!("[test] CDT mint/revoke tree");
+    let root = cdt::alloc_root(999, 0, ipc::CapKind::Endpoint(0), ipc::CAP_READ).expect("root");
+    let child =
+        cdt::alloc_child(root, 999, 1, ipc::CapKind::Endpoint(0), ipc::CAP_READ).expect("child");
+    let grandchild = cdt::alloc_child(child, 999, 2, ipc::CapKind::Endpoint(0), ipc::CAP_READ)
+        .expect("grandchild");
+    assert!(cdt::exists(root) && cdt::exists(child) && cdt::exists(grandchild));
+    assert_eq!(cdt::revoke_children(root), 2, "two descendants");
+    assert!(cdt::exists(root), "root must survive revoke");
+    assert!(!cdt::exists(child) && !cdt::exists(grandchild));
+    assert_eq!(cdt::revoke_children(root), 0, "revoke is idempotent");
+    cdt::free_node(root);
+    assert!(!cdt::exists(root));
+
+    // `revoke_owned` removes roots and descendants owned by the thread.
+    let root = cdt::alloc_root(1000, 0, ipc::CapKind::Endpoint(0), ipc::CAP_READ).unwrap();
+    let _ = cdt::alloc_child(root, 1000, 1, ipc::CapKind::Endpoint(0), ipc::CAP_READ);
+    assert_eq!(cdt::revoke_owned(1000), 2);
+    assert!(!cdt::exists(root));
+    serial_println!("    ok");
+}
+
+fn test_notification_bits() {
+    serial_println!("[test] notification fetch_or/swap");
+    let nid = ipc::create_notification().expect("notification");
+    assert_eq!(ipc::notify_poll(nid), Some(0));
+    assert!(ipc::notify_signal(nid, 0x2));
+    assert!(ipc::notify_signal(nid, 0x5));
+    assert_eq!(ipc::notify_poll(nid), Some(0x7));
+    assert_eq!(ipc::notify_poll(nid), Some(0));
     serial_println!("    ok");
 }
 

@@ -10,6 +10,7 @@ extern crate alloc;
 
 mod arch;
 mod bootinfo;
+mod cdt;
 mod console;
 mod dma;
 mod heap;
@@ -20,6 +21,7 @@ mod panic;
 mod pci;
 mod sched;
 mod serial;
+mod shm;
 mod syscall;
 mod user;
 
@@ -128,6 +130,7 @@ pub extern "C" fn _start() -> ! {
         server_caps[1] = Some(ipc::Capability {
             kind: ipc::CapKind::Endpoint(ep_id),
             rights: ipc::CAP_READ | ipc::CAP_WRITE,
+            node: ipc::NO_NODE,
         });
 
         let server_elf = include_bytes!(concat!(env!("OUT_DIR"), "/server.elf"));
@@ -141,6 +144,7 @@ pub extern "C" fn _start() -> ! {
         client_caps[1] = Some(ipc::Capability {
             kind: ipc::CapKind::Endpoint(ep_id),
             rights: ipc::CAP_READ | ipc::CAP_WRITE,
+            node: ipc::NO_NODE,
         });
 
         let client_elf = include_bytes!(concat!(env!("OUT_DIR"), "/client.elf"));
@@ -161,10 +165,12 @@ pub extern "C" fn _start() -> ! {
         serial_caps[1] = Some(ipc::Capability {
             kind: ipc::CapKind::Irq(4),
             rights: ipc::CAP_NOTIFY,
+            node: ipc::NO_NODE,
         });
         serial_caps[2] = Some(ipc::Capability {
             kind: ipc::CapKind::Endpoint(serial_ep),
             rights: ipc::CAP_READ | ipc::CAP_WRITE,
+            node: ipc::NO_NODE,
         });
         serial_caps[3] = Some(ipc::Capability {
             kind: ipc::CapKind::IoPort {
@@ -172,10 +178,12 @@ pub extern "C" fn _start() -> ! {
                 len: 8,
             },
             rights: ipc::CAP_READ | ipc::CAP_WRITE,
+            node: ipc::NO_NODE,
         });
         serial_caps[4] = Some(ipc::Capability {
             kind: ipc::CapKind::Endpoint(shell_in_ep),
             rights: ipc::CAP_WRITE,
+            node: ipc::NO_NODE,
         });
         let serial_elf = include_bytes!(concat!(env!("OUT_DIR"), "/serial.elf"));
         match user::launch(serial_elf, serial_caps) {
@@ -189,14 +197,17 @@ pub extern "C" fn _start() -> ! {
         kbd_caps[1] = Some(ipc::Capability {
             kind: ipc::CapKind::Irq(1),
             rights: ipc::CAP_NOTIFY,
+            node: ipc::NO_NODE,
         });
         kbd_caps[2] = Some(ipc::Capability {
             kind: ipc::CapKind::Endpoint(kbd_ep),
             rights: ipc::CAP_READ | ipc::CAP_WRITE,
+            node: ipc::NO_NODE,
         });
         kbd_caps[3] = Some(ipc::Capability {
             kind: ipc::CapKind::IoPort { base: 0x60, len: 5 },
             rights: ipc::CAP_READ | ipc::CAP_WRITE,
+            node: ipc::NO_NODE,
         });
         let kbd_elf = include_bytes!(concat!(env!("OUT_DIR"), "/kbd.elf"));
         match user::launch(kbd_elf, kbd_caps) {
@@ -215,15 +226,15 @@ pub extern "C" fn _start() -> ! {
 
             let _ = ipc::send(
                 fb_info_ep,
-                ipc::Message {
-                    data: {
+                ipc::Message::plain(
+                    {
                         let mut data = [0u8; ipc::MAX_MSG_LEN];
                         data[..bootinfo::FB_INFO_LEN].copy_from_slice(&fb.info_message());
                         data
                     },
-                    len: bootinfo::FB_INFO_LEN,
-                    sender: 0,
-                },
+                    bootinfo::FB_INFO_LEN,
+                    0,
+                ),
             );
 
             let mut fb_caps = [None; 16];
@@ -233,14 +244,17 @@ pub extern "C" fn _start() -> ! {
                     len: fb.len,
                 },
                 rights: ipc::CAP_READ | ipc::CAP_WRITE,
+                node: ipc::NO_NODE,
             });
             fb_caps[2] = Some(ipc::Capability {
                 kind: ipc::CapKind::Endpoint(fb_info_ep),
                 rights: ipc::CAP_READ,
+                node: ipc::NO_NODE,
             });
             fb_caps[3] = Some(ipc::Capability {
                 kind: ipc::CapKind::Endpoint(fb_console_ep),
                 rights: ipc::CAP_READ,
+                node: ipc::NO_NODE,
             });
 
             let fb_elf = include_bytes!(concat!(env!("OUT_DIR"), "/fb.elf"));
@@ -262,10 +276,12 @@ pub extern "C" fn _start() -> ! {
         init_caps[1] = Some(ipc::Capability {
             kind: ipc::CapKind::Endpoint(init_ep),
             rights: ipc::CAP_READ,
+            node: ipc::NO_NODE,
         });
         init_caps[2] = Some(ipc::Capability {
             kind: ipc::CapKind::Endpoint(shell_reply_ep),
             rights: ipc::CAP_WRITE,
+            node: ipc::NO_NODE,
         });
         let init_elf = include_bytes!(concat!(env!("OUT_DIR"), "/init.elf"));
         match user::launch(init_elf, init_caps) {
@@ -277,14 +293,17 @@ pub extern "C" fn _start() -> ! {
         shell_caps[1] = Some(ipc::Capability {
             kind: ipc::CapKind::Endpoint(init_ep),
             rights: ipc::CAP_WRITE,
+            node: ipc::NO_NODE,
         });
         shell_caps[2] = Some(ipc::Capability {
             kind: ipc::CapKind::Endpoint(shell_in_ep),
             rights: ipc::CAP_READ,
+            node: ipc::NO_NODE,
         });
         shell_caps[3] = Some(ipc::Capability {
             kind: ipc::CapKind::Endpoint(shell_reply_ep),
             rights: ipc::CAP_READ,
+            node: ipc::NO_NODE,
         });
         let shell_elf = include_bytes!(concat!(env!("OUT_DIR"), "/shell.elf"));
         match user::launch(shell_elf, shell_caps) {
@@ -306,10 +325,12 @@ pub extern "C" fn _start() -> ! {
                         len: dev.io_len,
                     },
                     rights: ipc::CAP_READ | ipc::CAP_WRITE,
+                    node: ipc::NO_NODE,
                 });
                 net_caps[2] = Some(ipc::Capability {
                     kind: ipc::CapKind::Dma { len: 64 * 1024 },
                     rights: ipc::CAP_READ | ipc::CAP_WRITE,
+                    node: ipc::NO_NODE,
                 });
                 let net_elf = include_bytes!(concat!(env!("OUT_DIR"), "/net.elf"));
                 match user::launch(net_elf, net_caps) {
@@ -320,6 +341,47 @@ pub extern "C" fn _start() -> ! {
             }
             None => crate::serial_println!("Milestone 9: virtio-net not present (skipped)"),
         }
+
+        // 7c. v0.2 capability-lifecycle stand: the supervisor owns one
+        //     endpoint, one notification, a DMA buffer and a control
+        //     endpoint. It spawns the server and client itself through
+        //     SYS_SPAWN, so M5–M9 wiring above stays untouched.
+        let v02_ep = ipc::create_endpoint();
+        let v02_go_ep = ipc::create_endpoint();
+        let v02_done_ep = ipc::create_endpoint();
+        let v02_notify = ipc::create_notification().expect("notification pool");
+        let mut sup_caps = [None; 16];
+        sup_caps[1] = Some(ipc::Capability {
+            kind: ipc::CapKind::Endpoint(v02_ep),
+            rights: ipc::CAP_READ | ipc::CAP_WRITE,
+            node: ipc::NO_NODE,
+        });
+        sup_caps[2] = Some(ipc::Capability {
+            kind: ipc::CapKind::Notification(v02_notify),
+            rights: ipc::CAP_READ | ipc::CAP_WRITE | ipc::CAP_NOTIFY,
+            node: ipc::NO_NODE,
+        });
+        sup_caps[3] = Some(ipc::Capability {
+            kind: ipc::CapKind::Dma { len: 4096 },
+            rights: ipc::CAP_READ | ipc::CAP_WRITE,
+            node: ipc::NO_NODE,
+        });
+        sup_caps[4] = Some(ipc::Capability {
+            kind: ipc::CapKind::Endpoint(v02_go_ep),
+            rights: ipc::CAP_READ | ipc::CAP_WRITE,
+            node: ipc::NO_NODE,
+        });
+        sup_caps[5] = Some(ipc::Capability {
+            kind: ipc::CapKind::Endpoint(v02_done_ep),
+            rights: ipc::CAP_READ | ipc::CAP_WRITE,
+            node: ipc::NO_NODE,
+        });
+        let supervisor_elf = include_bytes!(concat!(env!("OUT_DIR"), "/supervisor.elf"));
+        match user::launch(supervisor_elf, sup_caps) {
+            Ok(tid) => crate::serial_println!("supervisor thread id = {}", tid),
+            Err(e) => panic!("supervisor launch failed: {:?}", e),
+        }
+        crate::serial_println!("Milestone 10: v0.2 supervisor spawned");
 
         // 8. Bring up the application processors, then prove that both
         //    CPUs run their own run queues concurrently.

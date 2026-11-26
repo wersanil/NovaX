@@ -44,11 +44,7 @@ static SINK_EP: AtomicU64 = AtomicU64::new(NO_SINK);
 fn message(chunk: &[u8]) -> Message {
     let mut data = [0u8; MAX_MSG_LEN];
     data[..chunk.len()].copy_from_slice(chunk);
-    Message {
-        data,
-        len: chunk.len(),
-        sender: 0,
-    }
+    Message::plain(data, chunk.len(), 0)
 }
 
 fn offer(ep: u64, bytes: &[u8]) {
